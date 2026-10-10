@@ -1,0 +1,47 @@
+name: build
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - mytelegram-messenger-command-server
+          - mytelegram-messenger-query-server
+          - mytelegram-gateway-server
+          - mytelegram-auth-server
+          - mytelegram-data-seeder
+          - mytelegram-sms-sender
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr 'A-Z' 'a-z')
+          IMG=ghcr.io/$OWNER/testgram/${{ matrix.name }}:latest
+          docker build -f build/docker/Dockerfile-${{ matrix.name }} -t $IMG source
+          docker push $IMG
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: copy stock images
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr 'A-Z' 'a-z')
+          for n in mytelegram-session-server mytelegram-file-server; do
+            docker pull mytelegram/$n:latest
+            docker tag mytelegram/$n:latest ghcr.io/$OWNER/testgram/$n:latest
+            docker push ghcr.io/$OWNER/testgram/$n:latest
+          done
