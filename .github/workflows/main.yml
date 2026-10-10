@@ -27,7 +27,7 @@ jobs:
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr 'A-Z' 'a-z')
           IMG=ghcr.io/$OWNER/testgram/${{ matrix.name }}:latest
-          docker build -f build/docker/Dockerfile-${{ matrix.name }} -t $IMG source
+          docker build --build-arg BUILD_CONFIGURATION=Release -f build/docker/Dockerfile-${{ matrix.name }} -t $IMG source
           docker push $IMG
   mirror:
     runs-on: ubuntu-latest
