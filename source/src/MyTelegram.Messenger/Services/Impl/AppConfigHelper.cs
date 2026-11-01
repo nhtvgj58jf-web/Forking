@@ -18,6 +18,7 @@ public partial class AppConfigHelper : IAppConfigHelper, ISingletonDependency
         SetConfig("stars_paid_message_amount_max", new TJsonNumber { Value = 10000 });
         SetConfig("hidden_members_group_size_min", new TJsonNumber { Value = 10 });
         SetConfig("stargifts_blocked", new TJsonBool { Value = false });
+        SetConfig("stargifts_craft_attribute_permilles", new TJsonArray { Value = [new TJsonArray { Value = [new TJsonNumber { Value = 100 }] }, new TJsonArray { Value = [new TJsonNumber { Value = 80 }, new TJsonNumber { Value = 400 }] }, new TJsonArray { Value = [new TJsonNumber { Value = 70 }, new TJsonNumber { Value = 350 }, new TJsonNumber { Value = 700 }] }, new TJsonArray { Value = [new TJsonNumber { Value = 60 }, new TJsonNumber { Value = 300 }, new TJsonNumber { Value = 600 }, new TJsonNumber { Value = 1000 }] }] });
         SetConfig("stars_gifts_enabled", new TJsonBool { Value = true });
         SetConfig("premium_gift_attach_menu_icon", new TJsonBool { Value = true });
         SetConfig("premium_gift_text_field_icon", new TJsonBool { Value = true });

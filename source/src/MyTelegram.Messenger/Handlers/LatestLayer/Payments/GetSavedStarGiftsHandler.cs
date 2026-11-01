@@ -192,6 +192,7 @@ internal sealed class GetSavedStarGiftsHandler(
             if (canResellAt.HasValue && canResellAt.Value <= nowForCooldown) canResellAt = null;
             var canCraftAt = LaterTimestamp(doc.CanCraftAt, cooldownAt);
             if (canCraftAt.HasValue && canCraftAt.Value <= nowForCooldown) canCraftAt = null;
+            if (!canCraftAt.HasValue) { if (doc.IsUnique) { if (doc.GiftId == MyTelegram.Messenger.Handlers.LatestLayer.Payments.CraftConfig.DogGiftId) canCraftAt = nowForCooldown - 1; } }
 
             gifts.Add(new TSavedStarGift
             {
