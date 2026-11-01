@@ -10,7 +10,7 @@ internal sealed class GetStarGiftsHandler(IMongoDatabase mongoDatabase) : RpcRes
     protected override async Task<IStarGifts> HandleCoreAsync(IRequestInput input, RequestGetStarGifts obj)
     {
         var collection = mongoDatabase.GetCollection<StarGiftDocument>("star-gifts");
-        var docs = await collection.Find(FilterDefinition<StarGiftDocument>.Empty).ToListAsync();
+        var docs = await collection.Find(d => d.GiftId > 4).ToListAsync();
 
         // Count upgrade variants — all variants are shared across gifts
         var upgradeCol = mongoDatabase.GetCollection<BsonDocument>("star-gift-upgrade-config");
@@ -39,13 +39,13 @@ internal sealed class GetStarGiftsHandler(IMongoDatabase mongoDatabase) : RpcRes
                 Stars = doc.Stars,
                 ConvertStars = doc.ConvertStars,
                 UpgradeStars = doc.UpgradeStars,
-                Limited = doc.Limited,
+                Limited = doc.Limited || resaleByGiftId.ContainsKey(doc.GiftId),
                 SoldOut = doc.SoldOut,
                 Birthday = doc.Birthday,
                 RequirePremium = doc.RequirePremium,
                 LimitedPerUser = doc.LimitedPerUser,
-                AvailabilityTotal = doc.AvailabilityTotal ?? doc.AvailabilityRemains,
-                AvailabilityRemains = doc.AvailabilityRemains,
+                AvailabilityTotal = doc.AvailabilityTotal ?? doc.AvailabilityRemains ?? (resaleByGiftId.ContainsKey(doc.GiftId) ? (int?)1000000 : null),
+                AvailabilityRemains = doc.AvailabilityRemains ?? (resaleByGiftId.ContainsKey(doc.GiftId) ? (int?)1000000 : null),
                 AvailabilityResale = resaleByGiftId.TryGetValue(doc.GiftId, out var rs) ? rs.Count : null,
                 FirstSaleDate = doc.FirstSaleDate,
                 LastSaleDate = doc.LastSaleDate,
@@ -69,7 +69,7 @@ internal sealed class GetStarGiftsHandler(IMongoDatabase mongoDatabase) : RpcRes
                     MimeType = doc.MimeType ?? "application/x-tgsticker",
                     Size = doc.DocumentSize,
                     DcId = doc.DcId,
-                    Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+                    Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = (doc.MimeType == "image/webp" ? 128 : 512), H = (doc.MimeType == "image/webp" ? 128 : 512) }, new TDocumentAttributeFilename { FileName = (doc.MimeType == "image/webp" ? "sticker.webp" : "AnimatedSticker.tgs") }],
                 },
             });
         }

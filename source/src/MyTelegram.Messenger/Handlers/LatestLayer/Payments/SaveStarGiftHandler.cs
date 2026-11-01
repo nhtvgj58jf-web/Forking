@@ -13,7 +13,7 @@ internal sealed class SaveStarGiftHandler(IMongoDatabase mongoDatabase) : RpcRes
         {
             var filter = Builders<SavedStarGiftDocument>.Filter.And(
                 Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, input.UserId),
-                Builders<SavedStarGiftDocument>.Filter.Eq(d => d.MessageId, userGift.MsgId)
+                SavedStarGiftMsgIdHelper.MatchMsgId(userGift.MsgId)
             );
             var update = Builders<SavedStarGiftDocument>.Update.Set(d => d.Saved, !obj.Unsave);
             await collection.UpdateOneAsync(filter, update);

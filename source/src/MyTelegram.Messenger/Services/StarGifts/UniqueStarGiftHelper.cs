@@ -36,6 +36,7 @@ public static class UniqueStarGiftHelper
                 _ => new TStarGiftAttributeModel
                 {
                     Crafted = a.Crafted,
+                    Rarity = CraftRarity(a.Crafted ? a.RarityTier : null),
                     Name = a.Name,
                     Document = MakeDoc(a),
                     RarityPermille = a.RarityPermille,
@@ -94,6 +95,8 @@ public static class UniqueStarGiftHelper
             ValueCurrency = doc.InitialSaleStars > 0 ? "XTR" : null,
             ValueUsdAmount = doc.InitialSaleStars > 0 ? doc.InitialSaleStars : null,
             OfferMinStars = doc.OfferMinStars > 0 ? doc.OfferMinStars : null,
+            CraftChancePermille = MyTelegram.Messenger.Handlers.LatestLayer.Payments.CraftConfig.ChanceFor(doc),
+            Crafted = doc.Crafted,
         };
     }
 
@@ -148,6 +151,8 @@ public static class UniqueStarGiftHelper
         DcId = source.DcId,
     };
 
+    private static IStarGiftAttributeRarity? CraftRarity(string? tier) => tier switch { "uncommon" => new TStarGiftAttributeRarityUncommon(), "rare" => new TStarGiftAttributeRarityRare(), "epic" => new TStarGiftAttributeRarityEpic(), "legendary" => new TStarGiftAttributeRarityLegendary(), _ => null };
+
     private static IDocument MakeDoc(UniqueGiftAttribute a) => new TDocument
     {
         Id = a.DocumentId ?? 0,
@@ -157,7 +162,7 @@ public static class UniqueStarGiftHelper
         MimeType = a.MimeType ?? "application/x-tgsticker",
         Size = a.DocumentSize ?? 0,
         DcId = a.DcId ?? 2,
-        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
     };
 
     public static async Task<long> NextUniqueIdAsync(IMongoDatabase db)

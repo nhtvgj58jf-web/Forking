@@ -16,7 +16,8 @@ internal sealed class SendChangePhoneCodeHandler(
     ICommandBus commandBus,
     IQueryProcessor queryProcessor,
     IVerificationCodeGenerator verificationCodeGenerator,
-    IOptionsMonitor<MyTelegramMessengerServerOptions> options)
+    IOptionsMonitor<MyTelegramMessengerServerOptions> options,
+    MongoDB.Driver.IMongoDatabase mongoDatabase)
     : RpcResultObjectHandler<MyTelegram.Schema.Account.RequestSendChangePhoneCode, MyTelegram.Schema.Auth.ISentCode>
 {
     protected override async Task<MyTelegram.Schema.Auth.ISentCode> HandleCoreAsync(IRequestInput input, MyTelegram.Schema.Account.RequestSendChangePhoneCode obj)
@@ -28,6 +29,13 @@ internal sealed class SendChangePhoneCodeHandler(
         var existing = await queryProcessor.ProcessAsync(new GetUserByPhoneNumberQuery(phoneNumber));
         if (existing != null)
             RpcErrors.RpcErrors400.PhoneNumberOccupied.ThrowRpcError();
+
+        var allowed = await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("allowed_phones")
+            .CountDocumentsAsync(MongoDB.Driver.Builders<MongoDB.Bson.BsonDocument>.Filter.Eq("_id", phoneNumber));
+        if (allowed == 0)
+        {
+            RpcErrors.RpcErrors400.PhoneNumberInvalid.ThrowRpcError();
+        }
 
         var code = verificationCodeGenerator.Generate();
         var phoneCodeHash = Guid.NewGuid().ToString("N");

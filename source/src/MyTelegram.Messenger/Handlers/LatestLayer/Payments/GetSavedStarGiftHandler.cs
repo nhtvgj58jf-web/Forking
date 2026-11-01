@@ -55,7 +55,7 @@ internal sealed class GetSavedStarGiftHandler(IMongoDatabase mongoDatabase)
                         MimeType = doc.MimeType,
                         Size = doc.DocumentSize,
                         DcId = doc.DcId,
-                        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+                        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
                     },
                     meta);
             }

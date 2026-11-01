@@ -240,6 +240,17 @@ public sealed class FileDownloadLaneRouter(
 
     private async Task<bool> TryRerouteGroupCallStreamFileAsync(DataReceivedEvent eventData)
     {
+        if (eventData.ObjectId == 0xd9ab0f54)
+        {
+            await userAccessHashKeyCache.RememberAsync(eventData.UserId, eventData.AccessHashKeyId);
+            logger.LogInformation("Rerouting messages.getCustomEmojiDocuments from direct file-server queue to messenger query lane, reqMsgId: {ReqMsgId}", eventData.ReqMsgId);
+            await queryDataProcessor.ProcessAsync(
+                new MessengerQueryDataReceivedEvent(eventData.ConnectionId, eventData.ConnectionType, eventData.RequestId, eventData.ObjectId,
+                    eventData.UserId, eventData.ReqMsgId, eventData.SeqNumber, eventData.AuthKeyId, eventData.PermAuthKeyId,
+                    eventData.Data, eventData.Layer, eventData.Date, eventData.DeviceType, eventData.ClientIp, eventData.SessionId, eventData.AccessHashKeyId));
+            return true;
+        }
+
         if (!IsGetFileObjectId(eventData.ObjectId))
         {
             return false;

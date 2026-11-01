@@ -52,6 +52,7 @@ internal sealed class GetPaymentFormHandler(
 
         if (obj.Invoice is TInputInvoiceStarGiftUpgrade upgradeInvoice)
         {
+            Console.WriteLine($"UPGFORM user={input.UserId} type={upgradeInvoice.Stargift?.GetType().Name} msgId={(upgradeInvoice.Stargift as TInputSavedStarGiftUser)?.MsgId} savedId={(upgradeInvoice.Stargift as TInputSavedStarGiftChat)?.SavedId}");
             var savedCol = mongoDatabase.GetCollection<SavedStarGiftDocument>("saved-star-gifts");
             SavedStarGiftDocument? saved = upgradeInvoice.Stargift switch
             {
@@ -59,7 +60,7 @@ internal sealed class GetPaymentFormHandler(
                     Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, input.UserId)
                     & Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, false)
                     & Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null)
-                    & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync(),
+                    & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync() ?? await SavedStarGiftMsgIdHelper.AnchorByMessageAsync(savedCol, input.UserId, u.MsgId),
                 TInputSavedStarGiftChat c => await savedCol.Find(d =>
                     d.OwnerChannelId == ((c.Peer as TInputPeerChannel) == null ? 0 : ((TInputPeerChannel)c.Peer).ChannelId) &&
                     d.RandomId == c.SavedId &&
@@ -98,6 +99,19 @@ internal sealed class GetPaymentFormHandler(
                 {
                     Currency = "XTR",
                     Prices = [new TLabeledPrice { Label = "Upgrade", Amount = 0 }],
+                },
+            };
+        }
+
+        if (obj.Invoice is TInputInvoiceStarGiftTransfer)
+        {
+            return new TPaymentFormStarGift
+            {
+                FormId = Random.Shared.NextInt64(),
+                Invoice = new TInvoice
+                {
+                    Currency = "XTR",
+                    Prices = [new TLabeledPrice { Label = "Transfer", Amount = 25 }],
                 },
             };
         }

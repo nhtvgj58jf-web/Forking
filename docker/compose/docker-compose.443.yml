@@ -1,0 +1,11 @@
+services:
+  gateway-server:
+    ports:
+      - "443:20443"
+  auth-server:
+    volumes:
+      - ./rsa_private.pem:/app/secrets/mtproto/rsa_private.pem:ro
+    environment:
+      App__PrivateKeyFilePath: /app/secrets/mtproto/rsa_private.pem
+  session-server:
+    image: mytelegram/mytelegram-session-server:0.40.224.502

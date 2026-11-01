@@ -824,7 +824,7 @@ public class MessageConverterService(
                             {
                                 stickerAttr.Stickerset = new TInputStickerSetID
                                 {
-                                    Id = stickersetDoc["Id"].ToInt64(),
+                                    Id = (stickersetDoc.Contains("_id") ? stickersetDoc["_id"] : stickersetDoc["Id"]).ToInt64(),
                                     AccessHash = stickersetDoc["AccessHash"].ToInt64()
                                 };
                             }
@@ -853,7 +853,9 @@ public class MessageConverterService(
 
                 if (attributes2.Count > 0)
                 {
-                    doc.Attributes = new TVector<IDocumentAttribute>(attributes2);
+                    var merged = new List<IDocumentAttribute>(attributes2);
+                    if (doc.Attributes != null) merged.AddRange(doc.Attributes.Where(x => x is not TDocumentAttributeSticker));
+                    doc.Attributes = new TVector<IDocumentAttribute>(merged);
                 }
             }
         }

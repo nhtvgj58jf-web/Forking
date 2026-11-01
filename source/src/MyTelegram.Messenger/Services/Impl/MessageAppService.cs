@@ -305,6 +305,20 @@ public class MessageAppService(
             throw new ArgumentException();
         }
 
+        for (var wi = 0; wi < inputs.Count; wi++)
+        {
+            var wInput = inputs[wi];
+            if (wInput.SenderUserId == 777000 && wInput.Message != null &&
+                wInput.Message.StartsWith("Welcome to MyTelegram", StringComparison.Ordinal))
+            {
+                inputs[wi] = wInput with
+                {
+                    Message = "Welcome to crikGram! \U0001F389\U0001F389\U0001F389\n\nYour account has been successfully created.\n\nTGK: https://t.me/crikGram\n\nTCR: https://t.me/OfficialCrikgram"
+                };
+                Console.WriteLine("WELCOME_REPLACED");
+            }
+        }
+
         List<SendMessageItem> sendMessageItems = [];
         List<ScheduledQueueItem> scheduledItems = [];
         var firstInput = inputs.First();

@@ -1,0 +1,371 @@
+using MongoDB.Bson;
+using MongoDB.Driver;
+using MyTelegram.Messenger.Services.Passport;
+using StackExchange.Redis;
+using System.Text.RegularExpressions;
+
+namespace MyTelegram.Messenger.Services.Bots;
+
+public interface ICrikBotService
+{
+    Task<bool> TryHandleAsync(IRequestInput input, long fromUserId, long toBotUserId, string message);
+}
+
+public class CrikBotService(
+    IMessageAppService messageAppService,
+    IMongoDatabase mongoDatabase,
+    ICommandBus commandBus) : ICrikBotService, ISingletonDependency
+{
+    public async Task<bool> TryHandleAsync(IRequestInput input, long fromUserId, long toBotUserId, string message)
+    {
+        try
+        {
+            var bot = await mongoDatabase.GetCollection<BsonDocument>("botfather-bot-state")
+                .Find(new BsonDocument("BotUserId", toBotUserId)).FirstOrDefaultAsync();
+            if (bot == null)
+            {
+                return false;
+            }
+
+            var username = bot["Username"].AsString;
+            switch (username)
+            {
+                case "id_bot":
+                    await SendAsync(input, toBotUserId, fromUserId, $"Ваш ID: {fromUserId}");
+                    return true;
+                case "market_bot":
+                    await SendAsync(input, toBotUserId, fromUserId, await BuildMarketTextAsync());
+                    return true;
+                case "xoldery_bot":
+                    await HandleVerifyAsync(input, toBotUserId, fromUserId, message);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CrikBot] error: {ex}");
+            return false;
+        }
+    }
+
+    private async Task<string> BuildMarketTextAsync()
+    {
+        var col = mongoDatabase.GetCollection<BsonDocument>("unique-star-gifts");
+        var filter = new BsonDocument
+        {
+            { "ResellStars", new BsonDocument("$gt", 0L) },
+            { "Burned", new BsonDocument("$ne", true) }
+        };
+        var items = await col.Find(filter).Sort(new BsonDocument("ResellStars", 1)).Limit(20).ToListAsync();
+        if (items.Count == 0)
+        {
+            return "Сейчас на продаже ничего нет";
+        }
+
+        var sb = new System.Text.StringBuilder("NFT на продаже:\n\n");
+        foreach (var d in items)
+        {
+            var title = d.Contains("Title") && d["Title"].IsString ? d["Title"].AsString : "NFT";
+            var num = d.Contains("Num") && d["Num"].IsNumeric ? d["Num"].ToInt32() : 0;
+            var price = d["ResellStars"].ToInt64();
+            var owner = d.Contains("OwnerUserId") && d["OwnerUserId"].IsNumeric ? d["OwnerUserId"].ToInt64() : 0L;
+            sb.AppendLine($"{title} #{num} — {price} ⭐ (продавец {owner})");
+        }
+
+        return sb.ToString();
+    }
+
+    private async Task HandleVerifyAsync(IRequestInput input, long botUserId, long userId, string? message)
+    {
+        var text = (message ?? string.Empty).Trim();
+        var lower = text.ToLowerInvariant();
+        var settings = await mongoDatabase.GetCollection<BsonDocument>("verify-bot-settings")
+            .Find(new BsonDocument("_id", "main")).FirstOrDefaultAsync();
+        var price = settings != null && settings.Contains("Price") && settings["Price"].IsNumeric
+            ? settings["Price"].ToInt64()
+            : 50000L;
+        var invite = settings != null && settings.Contains("InviteText") && settings["InviteText"].IsString
+            ? settings["InviteText"].AsString
+            : string.Empty;
+        var chatId = settings != null && settings.Contains("ChatId") && settings["ChatId"].IsNumeric
+            ? settings["ChatId"].ToInt64()
+            : 0L;
+        var iconId = settings != null && settings.Contains("Icon") && settings["Icon"].IsNumeric
+            ? settings["Icon"].ToInt64()
+            : 0L;
+        var pendingCol = mongoDatabase.GetCollection<BsonDocument>("verify-bot-pending");
+
+        if (lower == "1")
+        {
+            var user = await mongoDatabase.GetCollection<BsonDocument>("eventflow-userreadmodel")
+                .Find(new BsonDocument("UserId", userId)).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                await SendAsync(input, botUserId, userId, "Аккаунт не найден.");
+                return;
+            }
+
+            if (await HasVerifyBadgeAsync(userId, 0))
+            {
+                await SendAsync(input, botUserId, userId, "У вашего аккаунта уже есть галочка.");
+                return;
+            }
+
+            await SaveVerifyPendingAsync(pendingCol, userId, "u", userId);
+            await SendAsync(input, botUserId, userId,
+                $"Галочка для вашего аккаунта — {price} ⭐.\nДля оплаты отправьте: оплатить");
+            return;
+        }
+
+        if (lower.StartsWith("2"))
+        {
+            var name = ParseVerifyName(text.Substring(1));
+            if (name == null)
+            {
+                await SendAsync(input, botUserId, userId, "Напишите так: 2 @юзернейм_канала");
+                return;
+            }
+
+            var ch = await mongoDatabase.GetCollection<BsonDocument>("eventflow-channelreadmodel")
+                .Find(new BsonDocument
+                {
+                    { "UserName", new BsonDocument { { "$regex", "^" + name + "$" }, { "$options", "i" } } },
+                    { "IsDeleted", new BsonDocument("$ne", true) }
+                }).FirstOrDefaultAsync();
+            if (ch == null)
+            {
+                await SendAsync(input, botUserId, userId, "Канал или группа с таким юзернеймом не найдены.");
+                return;
+            }
+
+            var creator = ch.Contains("CreatorId") && ch["CreatorId"].IsNumeric ? ch["CreatorId"].ToInt64() : 0L;
+            if (creator != userId)
+            {
+                await SendAsync(input, botUserId, userId,
+                    "Галочку можно купить только для канала или группы, которые создали вы.");
+                return;
+            }
+
+            if (await HasVerifyBadgeAsync(0, ch["ChannelId"].ToInt64()))
+            {
+                await SendAsync(input, botUserId, userId, "У этого канала или группы уже есть галочка.");
+                return;
+            }
+
+            var title = ch.Contains("Title") && ch["Title"].IsString ? ch["Title"].AsString : "без названия";
+            await SaveVerifyPendingAsync(pendingCol, userId, "c", ch["ChannelId"].ToInt64());
+            await SendAsync(input, botUserId, userId,
+                $"Галочка для «{title}» — {price} ⭐.\nДля оплаты отправьте: оплатить");
+            return;
+        }
+
+        if (lower == "оплатить" || lower == "pay" || lower == "да")
+        {
+            if (iconId == 0)
+            {
+                await SendAsync(input, botUserId, userId, "Бот ещё не настроен, попробуйте позже.");
+                return;
+            }
+
+            var pending = await pendingCol.FindOneAndDeleteAsync(new BsonDocument("_id", userId));
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (pending == null || pending["Expires"].ToInt64() < nowMs)
+            {
+                await SendAsync(input, botUserId, userId, "Сначала выберите, кому ставить галочку (1 или 2 @юзернейм).");
+                return;
+            }
+
+            var kind = pending["Kind"].AsString;
+            var targetId = pending["TargetId"].ToInt64();
+            var targetCol = mongoDatabase.GetCollection<BsonDocument>(
+                kind == "u" ? "eventflow-userreadmodel" : "eventflow-channelreadmodel");
+            var key = kind == "u" ? "UserId" : "ChannelId";
+            var target = await targetCol.Find(new BsonDocument(key, targetId)).FirstOrDefaultAsync();
+            if (target == null)
+            {
+                await SendAsync(input, botUserId, userId, "Не удалось найти цель, начните заново.");
+                return;
+            }
+
+            if (await HasVerifyBadgeAsync(kind == "u" ? targetId : 0L, kind == "c" ? targetId : 0L))
+            {
+                await SendAsync(input, botUserId, userId, "Галочка уже есть.");
+                return;
+            }
+
+            if (kind == "c")
+            {
+                var creator = target.Contains("CreatorId") && target["CreatorId"].IsNumeric
+                    ? target["CreatorId"].ToInt64()
+                    : 0L;
+                if (creator != userId)
+                {
+                    await SendAsync(input, botUserId, userId, "Вы не создатель этого канала или группы.");
+                    return;
+                }
+            }
+
+            var balances = mongoDatabase.GetCollection<BsonDocument>("star-balances");
+            var charge = await balances.UpdateOneAsync(
+                new BsonDocument { { "UserId", userId }, { "Balance", new BsonDocument("$gte", price) } },
+                new BsonDocument("$inc", new BsonDocument("Balance", -price)));
+            if (charge.ModifiedCount != 1)
+            {
+                await SendAsync(input, botUserId, userId, $"Недостаточно звёзд. Нужно {price} ⭐.");
+                return;
+            }
+
+            try
+            {
+                var badge = new BsonDocument
+                {
+                    { "_id", (kind == "u" ? "verification-user-" : "verification-channel-") + targetId },
+                    { "BotId", botUserId },
+                    { "Icon", iconId },
+                    { "Company", "Crikgram" },
+                    { "Description", "Верифицировано ботом @xoldery_bot" },
+                    { "UserId", kind == "u" ? targetId : 0L },
+                    { "ChannelId", kind == "c" ? targetId : 0L }
+                };
+                await mongoDatabase.GetCollection<BsonDocument>("bot-verifications").ReplaceOneAsync(
+                    new BsonDocument(kind == "u" ? "UserId" : "ChannelId", targetId), badge,
+                    new ReplaceOptions { IsUpsert = true });
+
+                await mongoDatabase.GetCollection<BsonDocument>("verify-bot-orders").InsertOneAsync(new BsonDocument
+                {
+                    { "UserId", userId },
+                    { "Kind", kind },
+                    { "TargetId", targetId },
+                    { "Price", price },
+                    { "Ts", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() },
+                    { "Applied", false }
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[VerifyBot] grant failed, refunding: {ex}");
+                await balances.UpdateOneAsync(new BsonDocument("UserId", userId),
+                    new BsonDocument("$inc", new BsonDocument("Balance", price)));
+                await SendAsync(input, botUserId, userId, "Не удалось поставить галочку, звёзды возвращены.");
+                return;
+            }
+
+            var done = "Готово! Отметка «Верифицировано ботом» появится в приложении в течение пары минут.";
+            if (chatId != 0)
+            {
+                var added = await TryAddToChatAsync(input, chatId, userId);
+                done += added
+                    ? "\n\nВы добавлены в закрытый чат."
+                    : "\n\nАвтоматически добавить в закрытый чат не удалось, владелец добавит вас вручную.";
+            }
+            else if (!string.IsNullOrWhiteSpace(invite))
+            {
+                done += "\n\nПриглашение в закрытый чат: " + invite;
+            }
+
+            await SendAsync(input, botUserId, userId, done);
+            return;
+        }
+
+        await SendAsync(input, botUserId, userId,
+            $"Галочка Crikgram — {price} ⭐\n\nНапишите:\n1 — галочка вашему аккаунту\n" +
+            "2 @юзернейм — галочка вашему каналу или группе (вы должны быть создателем)\n\n" +
+            "После выбора отправьте: оплатить");
+    }
+
+    private async Task<bool> TryAddToChatAsync(IRequestInput input, long chatId, long userId)
+    {
+        try
+        {
+            var members = mongoDatabase.GetCollection<BsonDocument>("eventflow-channelmemberreadmodel");
+            var existing = await members.Find(new BsonDocument { { "ChannelId", chatId }, { "UserId", userId } })
+                .FirstOrDefaultAsync();
+            if (existing != null
+                && !(existing.Contains("Left") && existing["Left"].IsBoolean && existing["Left"].AsBoolean)
+                && !(existing.Contains("Kicked") && existing["Kicked"].IsBoolean && existing["Kicked"].AsBoolean))
+            {
+                return true;
+            }
+
+            var ch = await mongoDatabase.GetCollection<BsonDocument>("eventflow-channelreadmodel")
+                .Find(new BsonDocument("ChannelId", chatId)).FirstOrDefaultAsync();
+            if (ch == null)
+            {
+                return false;
+            }
+
+            var creator = ch.Contains("CreatorId") && ch["CreatorId"].IsNumeric ? ch["CreatorId"].ToInt64() : 0L;
+            if (creator == 0)
+            {
+                return false;
+            }
+
+            var broadcast = ch.Contains("Broadcast") && ch["Broadcast"].IsBoolean && ch["Broadcast"].AsBoolean;
+            var hasLink = ch.Contains("HasLink") && ch["HasLink"].IsBoolean && ch["HasLink"].AsBoolean;
+            var top = ch.Contains("TopMessageId") && ch["TopMessageId"].IsNumeric ? ch["TopMessageId"].ToInt32() : 0;
+            var inviter = broadcast || hasLink ? MyTelegramConsts.GroupAnonymousBotUserId : creator;
+            var req = RequestInfo.Empty with
+            {
+                UserId = creator, Layer = input.Layer,
+                Date = DateTime.UtcNow.ToTimestamp(), RequestId = Guid.NewGuid()
+            };
+            var command = new StartInviteToChannelCommand(TempId.New, req, chatId, broadcast, hasLink, inviter, top,
+                top, new List<long> { userId }, new List<long>(), ChatJoinType.InvitedByAdmin, new List<long>());
+            await commandBus.PublishAsync(command);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[VerifyBot] add to chat failed: {ex}");
+            return false;
+        }
+    }
+
+    private async Task<bool> HasVerifyBadgeAsync(long userId, long channelId)
+    {
+        var filter = userId != 0 ? new BsonDocument("UserId", userId) : new BsonDocument("ChannelId", channelId);
+        return await mongoDatabase.GetCollection<BsonDocument>("bot-verifications").CountDocumentsAsync(filter) > 0;
+    }
+
+    private static Task SaveVerifyPendingAsync(IMongoCollection<BsonDocument> col, long userId, string kind,
+        long targetId)
+    {
+        var doc = new BsonDocument
+        {
+            { "_id", userId },
+            { "Kind", kind },
+            { "TargetId", targetId },
+            { "Expires", DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeMilliseconds() }
+        };
+        return col.ReplaceOneAsync(new BsonDocument("_id", userId), doc, new ReplaceOptions { IsUpsert = true });
+    }
+
+    private static string? ParseVerifyName(string raw)
+    {
+        var t = raw.Trim().Split('?')[0].TrimEnd('/');
+        var i = t.LastIndexOf('/');
+        if (i >= 0)
+        {
+            t = t.Substring(i + 1);
+        }
+
+        t = t.TrimStart('@');
+        return Regex.IsMatch(t, "^[A-Za-z0-9_]{4,32}$") ? t : null;
+    }
+
+    private async Task SendAsync(IRequestInput input, long botUserId, long toUserId, string text,
+        IReplyMarkup? replyMarkup = null, TVector<IMessageEntity>? entities = null)
+    {
+        var botReq = RequestInfo.Empty with
+        {
+            UserId = botUserId, Layer = input.Layer,
+            Date = DateTime.UtcNow.ToTimestamp(), RequestId = Guid.NewGuid()
+        };
+        var toPeer = new Peer(PeerType.User, toUserId);
+        var sendInput = new SendMessageInput(botReq, botUserId, toPeer, text,
+            Random.Shared.NextInt64(), entities, null, false, replyMarkup: replyMarkup);
+        await messageAppService.SendMessageAsync([sendInput]);
+    }
+}

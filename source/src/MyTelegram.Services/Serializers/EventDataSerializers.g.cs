@@ -903,7 +903,7 @@ public class LayeredPushMessageCreatedIntegrationEventEventDataSerializer : IEve
         writer.Write(data.Pts);
         writer.Write(data.Qts);
         writer.Write(data.GlobalSeqNo);
-        writer.Write(data.PushData);
+        writer.WriteByte(0); // TEMP: old session-server cannot read PushData
         writer.Write(data.ExcludeUserIds);
     }
 

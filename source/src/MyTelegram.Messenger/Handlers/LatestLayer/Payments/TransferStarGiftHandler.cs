@@ -6,16 +6,19 @@ namespace MyTelegram.Messenger.Handlers.LatestLayer.Payments;
 internal sealed class TransferStarGiftHandler(IMongoDatabase mongoDatabase, IMessageAppService messageAppService, IPeerHelper peerHelper, IQueryProcessor queryProcessor)
     : RpcResultObjectHandler<MyTelegram.Schema.Payments.RequestTransferStarGift, IUpdates>
 {
-    protected override async Task<IUpdates> HandleCoreAsync(IRequestInput input, MyTelegram.Schema.Payments.RequestTransferStarGift obj)
+    protected override Task<IUpdates> HandleCoreAsync(IRequestInput input, MyTelegram.Schema.Payments.RequestTransferStarGift obj)
+        => TransferAsync(input, obj.Stargift, obj.ToId);
+
+    public async Task<IUpdates> TransferAsync(IRequestInput input, MyTelegram.Schema.IInputSavedStarGift stargift, MyTelegram.Schema.IInputPeer toId)
     {
         var col = mongoDatabase.GetCollection<UniqueStarGiftDocument>("unique-star-gifts");
         var savedCol = mongoDatabase.GetCollection<SavedStarGiftDocument>("saved-star-gifts");
 
         UniqueStarGiftDocument? doc;
         bool ownerVerified = false;
-        if (obj.Stargift is TInputSavedStarGiftUser u)
+        if (stargift is TInputSavedStarGiftUser u)
         {
-            var saved = await savedCol.Find(d => d.OwnerUserId == input.UserId && d.IsUnique && (d.MessageId == u.MsgId || d.RandomId == u.MsgId)).FirstOrDefaultAsync();
+            var saved = await savedCol.Find(Builders<SavedStarGiftDocument>.Filter.Where(d => d.OwnerUserId == input.UserId && d.IsUnique) & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync();
             doc = saved != null
                 ? await col.Find(d => d.Slug == saved.UniqueSlug).FirstOrDefaultAsync()
                 : null;
@@ -23,7 +26,7 @@ internal sealed class TransferStarGiftHandler(IMongoDatabase mongoDatabase, IMes
         }
         else
         {
-            doc = obj.Stargift switch
+            doc = stargift switch
             {
                 TInputSavedStarGiftSlug s => await col.Find(d => d.Slug == s.Slug && d.OwnerUserId == input.UserId).FirstOrDefaultAsync(),
                 TInputSavedStarGiftChat c => await col.Find(d => d.UniqueId == c.SavedId).FirstOrDefaultAsync(),
@@ -32,6 +35,15 @@ internal sealed class TransferStarGiftHandler(IMongoDatabase mongoDatabase, IMes
         }
 
         if (doc == null) RpcErrors.RpcErrors400.StargiftNotFound.ThrowRpcError();
+        if (!ownerVerified && doc!.OwnerChannelId > 0 && stargift is TInputSavedStarGiftChat)
+        {
+            var gChannelId = doc.OwnerChannelId;
+            var chCol = mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelreadmodel");
+            var isCreator = await chCol.CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", gChannelId }, { "CreatorId", input.UserId } }) > 0;
+            var isChAdmin = isCreator || await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelmemberreadmodel")
+                .CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", gChannelId }, { "UserId", input.UserId }, { "IsAdmin", true }, { "Left", false } }) > 0;
+            ownerVerified = isChAdmin;
+        }
         if (!ownerVerified && doc!.OwnerUserId != input.UserId) RpcErrors.RpcErrors400.StargiftOwnerInvalid.ThrowRpcError();
 
         // Check if gift was burned (used in crafting)
@@ -50,7 +62,7 @@ internal sealed class TransferStarGiftHandler(IMongoDatabase mongoDatabase, IMes
         if (lockedUntil.HasValue && lockedUntil.Value <= currentTime)
             lockedUntil = null;
 
-        var toPeer = peerHelper.GetPeer(obj.ToId, input.UserId)!;
+        var toPeer = peerHelper.GetPeer(toId, input.UserId)!;
         var newOwnerUserId = toPeer.PeerType == PeerType.User ? toPeer.PeerId : 0L;
         var newOwnerChannelId = toPeer.PeerType == PeerType.Channel ? toPeer.PeerId : 0L;
 
@@ -114,24 +126,6 @@ internal sealed class TransferStarGiftHandler(IMongoDatabase mongoDatabase, IMes
                 RequestInfo.Empty with { UserId = input.UserId, Layer = MyTelegramConsts.Layer, Date = now, RequestId = Guid.NewGuid() },
                 input.UserId,
                 new Peer(PeerType.User, newOwnerUserId),
-                string.Empty,
-                Random.Shared.NextInt64(),
-                sendMessageType: SendMessageType.MessageService,
-                messageType: MessageType.Text,
-                messageAction: action
-            )]);
-        }
-        else if (newOwnerChannelId > 0)
-        {
-            // Item 19: also surface the transfer in the recipient channel so the unique-gift
-            // record (including any upgrade attributes) is visible there. Without this, an
-            // upgraded NFT transferred to a channel would silently change owner with no
-            // service-message trail and clients could fail to surface it.
-            action.Peer = new TPeerChannel { ChannelId = newOwnerChannelId };
-            await messageAppService.SendMessageAsync([new SendMessageInput(
-                RequestInfo.Empty with { UserId = input.UserId, Layer = MyTelegramConsts.Layer, Date = now, RequestId = Guid.NewGuid() },
-                input.UserId,
-                new Peer(PeerType.Channel, newOwnerChannelId),
                 string.Empty,
                 Random.Shared.NextInt64(),
                 sendMessageType: SendMessageType.MessageService,

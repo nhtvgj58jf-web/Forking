@@ -27,13 +27,31 @@ internal sealed class ToggleStarGiftsPinnedToTopHandler(IMongoDatabase mongoData
                 ? Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerChannelId, ownerChannelId)
                 : Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, ownerUserId);
             var selectedFilter = Builders<SavedStarGiftDocument>.Filter.Where(_ => false);
-            if (msgIds.Count > 0) selectedFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.MessageId, msgIds);
+            foreach (var m in msgIds) selectedFilter |= SavedStarGiftMsgIdHelper.MatchMsgId(m);
             if (savedIds.Count > 0) selectedFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.RandomId, savedIds);
             if (slugs.Count > 0) selectedFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.UniqueSlug, slugs);
 
             await col.UpdateManyAsync(
                 ownerFilter & selectedFilter,
                 Builders<SavedStarGiftDocument>.Update.Set(d => d.PinnedToTop, true));
+        }
+
+        var pinOrder = 0;
+        foreach (var g in obj.Stargift)
+        {
+            FilterDefinition<SavedStarGiftDocument>? one = g switch
+            {
+                TInputSavedStarGiftUser uu => SavedStarGiftMsgIdHelper.MatchMsgId(uu.MsgId),
+                TInputSavedStarGiftChat cc => Builders<SavedStarGiftDocument>.Filter.Eq(d => d.RandomId, cc.SavedId),
+                TInputSavedStarGiftSlug ss => Builders<SavedStarGiftDocument>.Filter.Eq(d => d.UniqueSlug, ss.Slug),
+                _ => null
+            };
+            if (one == null) continue;
+            var ownerOne = isChannel
+                ? Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerChannelId, ownerChannelId)
+                : Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, ownerUserId);
+            await col.UpdateManyAsync(ownerOne & one, Builders<SavedStarGiftDocument>.Update.Set(d => d.PinOrder, pinOrder));
+            pinOrder++;
         }
 
         return new TBoolTrue();

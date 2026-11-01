@@ -9,6 +9,7 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
 {
     protected override async Task<IUpdates> HandleCoreAsync(IRequestInput input, MyTelegram.Schema.Payments.RequestUpgradeStarGift obj)
     {
+        Console.WriteLine($"UPGDBG user={input.UserId} type={obj.Stargift?.GetType().Name} msgId={(obj.Stargift as TInputSavedStarGiftUser)?.MsgId}");
         var savedCol = mongoDatabase.GetCollection<SavedStarGiftDocument>("saved-star-gifts");
 
         // Resolve the saved gift precisely from whichever InputSavedStarGift
@@ -27,6 +28,29 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
                     & Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, false)
                     & Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null)
                     & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync();
+                // Gifts bought before their service message had an id are saved with MessageId == 0.
+                // Anchor the one the client clicked: take that message, then the closest unanchored gift in time.
+                if (saved == null)
+                {
+                    var msgDoc = await savedCol.Database.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-messagereadmodel")
+                        .Find(new MongoDB.Bson.BsonDocument { { "OwnerPeerId", input.UserId }, { "MessageId", u.MsgId }, { "SendMessageType", 2 } })
+                        .Project(new MongoDB.Bson.BsonDocument { { "Date", 1 }, { "MessageAction", 1 } })
+                        .FirstOrDefaultAsync();
+                    if (msgDoc != null && msgDoc.Contains("Date") && msgDoc.Contains("MessageAction") && !msgDoc["MessageAction"].IsBsonNull)
+                    {
+                        var msgDate = msgDoc["Date"].ToInt32();
+                        var candidates = await savedCol.Find(d => d.OwnerUserId == input.UserId && d.MessageId == 0 && !d.IsUnique
+                            && d.UpgradeStars.HasValue && d.Date >= msgDate - 10 && d.Date <= msgDate + 10).ToListAsync();
+                        var best = candidates.OrderBy(d => Math.Abs(d.Date - msgDate)).FirstOrDefault();
+                        if (best != null)
+                        {
+                            await savedCol.UpdateOneAsync(d => d.Id == best.Id && d.MessageId == 0,
+                                Builders<SavedStarGiftDocument>.Update.Set(d => d.MessageId, u.MsgId));
+                            best.MessageId = u.MsgId;
+                            saved = best;
+                        }
+                    }
+                }
                 break;
             case TInputSavedStarGiftUser:
                 // msg_id == 0 → most recently received upgradable gift only.
@@ -48,6 +72,17 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
 
         if (saved == null)
             throw new RpcException(new RpcError(400, "STARGIFT_NOT_FOUND"));
+
+        if (saved.OwnerChannelId > 0)
+        {
+            var upgChannelId = saved.OwnerChannelId;
+            var upgChCol = mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelreadmodel");
+            var upgIsCreator = await upgChCol.CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", upgChannelId }, { "CreatorId", input.UserId } }) > 0;
+            var upgIsAdmin = upgIsCreator || await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelmemberreadmodel")
+                .CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", upgChannelId }, { "UserId", input.UserId }, { "IsAdmin", true }, { "Left", false } }) > 0;
+            if (!upgIsAdmin) RpcErrors.RpcErrors400.StargiftOwnerInvalid.ThrowRpcError();
+        }
+
 
         if (saved!.IsUnique)
             throw new RpcException(new RpcError(400, "STARGIFT_ALREADY_UPGRADED"));
@@ -164,7 +199,7 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
             DocumentSize = saved.DocumentSize,
             DcId = saved.DcId,
             // Set 21-day transfer cooldown after upgrade (from telelakel: "21-day transfer cooldown")
-            TransferLockedUntil = currentTimestamp + (21 * 24 * 60 * 60),
+            TransferLockedUntil = currentTimestamp - 60,
             ThemeAvailable = giftTypeTheme?.ThemeAvailable ?? false,
             ThemeSettings = giftTypeTheme?.ThemeSettings,
         };
@@ -172,7 +207,7 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
 
         if (chargedUpgradeStars.HasValue && chargedUpgradeStars.Value > 0)
         {
-            await StarsBalanceHelper.AddTransactionAsync(mongoDatabase, effectiveUserId, -chargedUpgradeStars.Value,
+            await StarsBalanceHelper.AddTransactionAsync(mongoDatabase, effectiveChannelId > 0 ? input.UserId : effectiveUserId, -chargedUpgradeStars.Value,
                 gift: true, title: transactionTitle ?? "Gift upgrade", stargiftUpgrade: true, stargiftSlug: uniqueDoc.Slug);
         }
 
@@ -212,12 +247,21 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
             DcId = saved.DcId,
         });
 
+        int lastMsgIdBefore = 0;
+        IUpdate? newMsgUpdate = null;
         // Telegram does not need a visible upgrade notice for channel-owned gifts:
         // keep the collectible on the channel profile without injecting a service
         // message into either the channel history or the admin's Saved Messages.
         if (effectiveChannelId == 0)
         {
             var uniqueTl = UniqueStarGiftHelper.ToTl(uniqueDoc);
+            var msgCol = mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-messagereadmodel");
+            var lastBefore = await msgCol
+                .Find(new MongoDB.Bson.BsonDocument { { "OwnerPeerId", effectiveUserId }, { "SendMessageType", 2 } })
+                .Sort(new MongoDB.Bson.BsonDocument("MessageId", -1))
+                .Project(new MongoDB.Bson.BsonDocument("MessageId", 1))
+                .FirstOrDefaultAsync();
+            lastMsgIdBefore = lastBefore != null && lastBefore.Contains("MessageId") ? lastBefore["MessageId"].ToInt32() : 0;
             var action = new TMessageActionStarGiftUnique
             {
                 Gift = uniqueTl,
@@ -227,7 +271,7 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
             };
 
             var sendInput = new SendMessageInput(
-                input.ToRequestInfo() with { ReqMsgId = 0 },
+                input.ToRequestInfo() with { ReqMsgId = 0, PermAuthKeyId = 0 },
                 effectiveUserId,
                 new Peer(PeerType.User, effectiveUserId),
                 string.Empty,
@@ -237,11 +281,45 @@ internal sealed class UpgradeStarGiftHandler(IMongoDatabase mongoDatabase, IMess
                 messageAction: action
             );
             await messageAppService.SendMessageAsync([sendInput]);
+
+            // Return the new service message in the RPC result so the client can play the reveal animation
+            // right away instead of waiting for the separate push.
+            for (var i = 0; i < 30 && newMsgUpdate == null; i++)
+            {
+                var created = await msgCol
+                    .Find(new MongoDB.Bson.BsonDocument
+                    {
+                        { "OwnerPeerId", effectiveUserId }, { "SendMessageType", 2 },
+                        { "MessageId", new MongoDB.Bson.BsonDocument("$gt", lastMsgIdBefore) }
+                    })
+                    .Sort(new MongoDB.Bson.BsonDocument("MessageId", -1))
+                    .Project(new MongoDB.Bson.BsonDocument { { "MessageId", 1 }, { "Pts", 1 }, { "Date", 1 } })
+                    .FirstOrDefaultAsync();
+                if (created != null && created.Contains("Pts"))
+                {
+                    newMsgUpdate = new TUpdateNewMessage
+                    {
+                        Message = new TMessageService
+                        {
+                            Id = created["MessageId"].ToInt32(),
+                            FromId = new TPeerUser { UserId = effectiveUserId },
+                            PeerId = new TPeerUser { UserId = effectiveUserId },
+                            Date = created.Contains("Date") ? created["Date"].ToInt32() : uniqueDoc.Date,
+                            Action = action,
+                            Out = true,
+                        },
+                        Pts = created["Pts"].ToInt32(),
+                        PtsCount = 1,
+                    };
+                    break;
+                }
+                await Task.Delay(100);
+            }
         }
 
         return new TUpdates
         {
-            Updates = new TVector<IUpdate>(),
+            Updates = newMsgUpdate != null ? new TVector<IUpdate> { newMsgUpdate } : new TVector<IUpdate>(),
             Users = new TVector<IUser>(), Chats = new TVector<IChat>(), Date = uniqueDoc.Date, Seq = 0
         };
     }

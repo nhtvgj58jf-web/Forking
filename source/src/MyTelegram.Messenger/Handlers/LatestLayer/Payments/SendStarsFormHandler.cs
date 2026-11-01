@@ -280,7 +280,7 @@ internal sealed class SendStarsFormHandler(
                             Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, input.UserId)
                             & Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, false)
                             & Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null)
-                            & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync();
+                            & SavedStarGiftMsgIdHelper.MatchMsgId(u.MsgId)).FirstOrDefaultAsync(); saved ??= await SavedStarGiftMsgIdHelper.AnchorByMessageAsync(savedCol, input.UserId, u.MsgId);
                     }
                     else
                     {
@@ -310,6 +310,16 @@ internal sealed class SendStarsFormHandler(
 
             if (saved == null || saved.IsUnique || !saved.UpgradeStars.HasValue)
                 RpcErrors.RpcErrors400.StargiftUpgradeUnavailable.ThrowRpcError();
+
+            if (saved!.OwnerChannelId > 0)
+            {
+                var upgChannelId = saved!.OwnerChannelId;
+                var upgChCol = mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelreadmodel");
+                var upgIsCreator = await upgChCol.CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", upgChannelId }, { "CreatorId", input.UserId } }) > 0;
+                var upgIsAdmin = upgIsCreator || await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("eventflow-channelmemberreadmodel")
+                    .CountDocumentsAsync(new MongoDB.Bson.BsonDocument { { "ChannelId", upgChannelId }, { "UserId", input.UserId }, { "IsAdmin", true }, { "Left", false } }) > 0;
+                if (!upgIsAdmin) RpcErrors.RpcErrors400.StargiftOwnerInvalid.ThrowRpcError();
+            }
 
             var bal = await StarsBalanceHelper.GetBalanceAsync(mongoDatabase, input.UserId);
             if (bal < saved!.UpgradeStars!.Value)
@@ -362,6 +372,18 @@ internal sealed class SendStarsFormHandler(
 
             var upgradeHandler = new UpgradeStarGiftHandler(mongoDatabase, messageAppService);
             return new TPaymentResult { Updates = await upgradeHandler.UpgradeAsync(input, saved, giftDoc, chargedUpgradeStars, "In-App Purchase") };
+        }
+
+        if (obj.Invoice is TInputInvoiceStarGiftTransfer transferInvoice)
+        {
+            var transferHandler = new TransferStarGiftHandler(mongoDatabase, messageAppService, peerHelper, queryProcessor);
+            const long transferCost = 25;
+            var transferBalance = await StarsBalanceHelper.GetBalanceAsync(mongoDatabase, input.UserId);
+            if (transferBalance < transferCost) RpcErrors.RpcErrors400.BalanceTooLow.ThrowRpcError();
+            var transferUpdates = await transferHandler.TransferAsync(input, transferInvoice.Stargift, transferInvoice.ToId);
+            await StarsBalanceHelper.AddBalanceAsync(mongoDatabase, input.UserId, -transferCost);
+            await StarsBalanceHelper.AddTransactionAsync(mongoDatabase, input.UserId, -transferCost, title: "Gift transfer", gift: true);
+            return new TPaymentResult { Updates = transferUpdates };
         }
 
         if (obj.Invoice is TInputInvoiceStarGiftDropOriginalDetails dropInvoice)
@@ -692,7 +714,7 @@ internal sealed class SendStarsFormHandler(
                 MimeType = gift.MimeType,
                 Size = gift.DocumentSize,
                 DcId = gift.DcId,
-                Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+                Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
             },
         };
 
@@ -748,7 +770,7 @@ internal sealed class SendStarsFormHandler(
         else
         {
             var sendMessageInput = new SendMessageInput(
-                input.ToRequestInfo() with { ReqMsgId = 0 },
+                input.ToRequestInfo() with { ReqMsgId = 0, PermAuthKeyId = 0 },
                 input.UserId,
                 toPeer,
                 string.Empty,

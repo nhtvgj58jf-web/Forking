@@ -65,7 +65,7 @@ STRINGS = {
         "add_number": "➕ Add number",
         "switch_lang": "🌐 Русский",
         "no_numbers": "📱 No linked numbers.\nLimit: 0/{max}",
-        "your_numbers": "📱 Your TestGram numbers:\n{numbers}\n\nLimit: {count}/{max}",
+        "your_numbers": "📱 Your CrikGram numbers:\n{numbers}\n\nLimit: {count}/{max}",
         "limit_alert": "Limit is {max} numbers",
         "enter_number": "Send the number: +79XXXXXXXXX",
         "bad_format": "Invalid format",
@@ -79,7 +79,7 @@ STRINGS = {
         "add_number": "➕ Добавить номер",
         "switch_lang": "🌐 English",
         "no_numbers": "📱 Нет привязанных номеров.\nЛимит: 0/{max}",
-        "your_numbers": "📱 Ваши номера TestGram:\n{numbers}\n\nЛимит: {count}/{max}",
+        "your_numbers": "📱 Ваши номера CrikGram:\n{numbers}\n\nЛимит: {count}/{max}",
         "limit_alert": "Лимит {max} номера",
         "enter_number": "Введите номер: +79XXXXXXXXX",
         "bad_format": "Неверный формат",
@@ -275,15 +275,20 @@ async def add_number(tg_id, phone, bot_id):
     return "ok"
 
 
+async def add_number_force(tg_id, phone, bot_id):
+    """Привязка купленного номера: лимит бесплатных номеров на платные не распространяется."""
+    await _db.execute("INSERT OR IGNORE INTO user_numbers (tg_id, phone, bot_id) VALUES (?,?,?)", (tg_id, phone, bot_id))
+    await _db.commit()
+
+
 async def remove_number(tg_id, phone):
     """Detach a phone number from a Telegram user."""
-    await _db.execute("DELETE FROM user_numbers WHERE tg_id=? AND phone=?", (tg_id, phone))
+    return  # удаление отключено
     await _db.commit()
 
 def numbers_keyboard(numbers, lang):
     """The inline keyboard for adding/removing numbers and switching language."""
-    buttons = [[InlineKeyboardButton(text=f"❌ {n}", callback_data=f"del:{n}")] for n in numbers]
-    buttons.append([InlineKeyboardButton(text=t(lang, "add_number"), callback_data="add")])
+    buttons = []
     other = "ru" if lang == "en" else "en"
     buttons.append([InlineKeyboardButton(text=t(lang, "switch_lang"), callback_data=f"lang:{other}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -297,6 +302,14 @@ def status_text(numbers, lang):
     return t(lang, "your_numbers", numbers=nums_str, count=len(numbers), max=MAX_NUMBERS)
 
 
+import shop; shop.register(dp, get_user_numbers)
+import admin; admin.register(dp)
+import gift_rotate; gift_rotate.register(dp)
+import mintnft; mintnft.register(dp)
+import number; number.register(dp, get_user_numbers, add_number, MAX_NUMBERS)
+import number; number.register_start(dp, get_lang, get_user_numbers, status_text, numbers_keyboard)
+import orders
+orders.register(dp, get_user_numbers, add_number_force)
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     waiting_for_phone.discard(message.from_user.id)
@@ -318,6 +331,8 @@ async def cb_lang(call: CallbackQuery):
 @dp.callback_query(F.data == "add")
 async def cb_add(call: CallbackQuery):
     """Start the phone-number binding flow."""
+    await call.answer("Используйте «🎲 Получить случайный номер»", show_alert=True)
+    return
     lang = await get_lang(call.from_user.id, call.from_user.language_code)
     numbers = await get_user_numbers(call.from_user.id)
     if len(numbers) >= MAX_NUMBERS:
@@ -331,7 +346,7 @@ async def cb_add(call: CallbackQuery):
 async def cb_del(call: CallbackQuery):
     """Remove the selected phone number from the user's account."""
     lang = await get_lang(call.from_user.id, call.from_user.language_code)
-    await remove_number(call.from_user.id, call.data[4:])
+    await call.answer("Удаление номеров отключено", show_alert=True); return
     numbers = await get_user_numbers(call.from_user.id)
     await call.message.edit_text(status_text(numbers, lang), reply_markup=numbers_keyboard(numbers, lang))
     await call.answer()
@@ -465,7 +480,9 @@ async def main():
         logger.info("No proxy, connecting to Telegram directly")
 
     for token in BOT_TOKENS:
-        session = AiohttpSession(proxy=proxy_url) if proxy_url else None
+        from aiogram.client.telegram import PRODUCTION, TelegramAPIServer
+        _base = os.environ.get("TG_API_BASE", "").rstrip("/")
+        session = AiohttpSession(proxy=proxy_url or None, api=TelegramAPIServer.from_base(_base) if _base else PRODUCTION) if (proxy_url or _base) else None
         # Creating the Bot can fail on its own for a malformed token, and one bad token must not take the
         # other bots down with it.
         b = None
@@ -484,6 +501,18 @@ async def main():
         raise RuntimeError("No bot could be authorized; check the tokens in .env")
 
     await open_db()
+
+    from aiogram.types import BotCommand
+    for b in bots.values():
+        try:
+            await b.set_my_commands([
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="number", description="Получить номер для входа"),
+                BotCommand(command="shop", description="Купить звёзды Крикграма"),
+                BotCommand(command="help", description="Список функций"),
+            ])
+        except Exception as e:
+            logger.warning("set_my_commands failed: %s", e)
 
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()

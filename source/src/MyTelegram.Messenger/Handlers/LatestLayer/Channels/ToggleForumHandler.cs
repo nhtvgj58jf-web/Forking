@@ -22,7 +22,8 @@ internal sealed class ToggleForumHandler(
     IPeerHelper peerHelper,
     IChannelAdminRightsChecker channelAdminRightsChecker,
     IQueryProcessor queryProcessor,
-    IObjectMapper objectMapper) : RpcResultObjectHandler<MyTelegram.Schema.Channels.RequestToggleForum, MyTelegram.Schema.IUpdates>
+    IObjectMapper objectMapper,
+    MyTelegram.Messenger.Converters.ConverterServices.IChatConverterService chatConverterService) : RpcResultObjectHandler<MyTelegram.Schema.Channels.RequestToggleForum, MyTelegram.Schema.IUpdates>
 {
     protected override async Task<MyTelegram.Schema.IUpdates> HandleCoreAsync(IRequestInput input, MyTelegram.Schema.Channels.RequestToggleForum obj)
     {
@@ -68,27 +69,27 @@ internal sealed class ToggleForumHandler(
         var currentForum = channelDoc.Contains("Forum") && channelDoc["Forum"].AsBoolean;
         var currentTabs = channelDoc.Contains("ForumTabs") && channelDoc["ForumTabs"].AsBoolean;
         var newTabs = obj.Enabled && obj.Tabs;
-        if (currentForum == obj.Enabled && currentTabs == newTabs)
-            RpcErrors.RpcErrors400.ChatNotModified.ThrowRpcError();
-
-        var filter = Builders<BsonDocument>.Filter.Eq("ChannelId", channelId);
-        var update = Builders<BsonDocument>.Update
-            .Set("Forum", obj.Enabled)
-            .Set("ForumTabs", newTabs);
-        await collection.UpdateOneAsync(filter, update);
-
-        // Create General topic when enabling forum
-        if (obj.Enabled)
+        var unchanged = currentForum == obj.Enabled && currentTabs == newTabs;
+        if (!unchanged)
         {
-            await ForumTopicHelper.EnsureGeneralTopicAsync(mongoDatabase, channelId, input.UserId);
+            var filter = Builders<BsonDocument>.Filter.Eq("ChannelId", channelId);
+            var update = Builders<BsonDocument>.Update
+                .Set("Forum", obj.Enabled)
+                .Set("ForumTabs", newTabs);
+            await collection.UpdateOneAsync(filter, update);
+
+            // Create General topic when enabling forum
+            if (obj.Enabled)
+            {
+                await ForumTopicHelper.EnsureGeneralTopicAsync(mongoDatabase, channelId, input.UserId);
+            }
+
+            // Log to admin log
+            await AdminLogHelper.LogToggleForum(mongoDatabase, channelId, input.UserId, obj.Enabled);
         }
 
-        // Log to admin log
-        await AdminLogHelper.LogToggleForum(mongoDatabase, channelId, input.UserId, obj.Enabled);
-
         // Get updated channel
-        var channelReadModel = await queryProcessor.ProcessAsync(new GetChannelByIdQuery(channelId), default);
-        var channel = objectMapper.Map<IChannelReadModel, IChat>(channelReadModel!);
+        var channel = await chatConverterService.GetChannelAsync(input, channelId, false, null, input.Layer, false);
         if (channel is TChannel tChannel)
         {
             tChannel.Forum = obj.Enabled;
@@ -97,7 +98,7 @@ internal sealed class ToggleForumHandler(
 
         return new TUpdates
         {
-            Updates = new TVector<IUpdate>(),
+            Updates = new TVector<IUpdate>(new IUpdate[] { new TUpdateChannel { ChannelId = channelId } }),
             Users = new TVector<IUser>(),
             Chats = new TVector<IChat> { channel },
             Date = CurrentDate

@@ -346,10 +346,8 @@ public partial class AppConfigHelper
                 },
 
                 //  
-                new TJsonObjectValue { Key = "freeze_since_date", Value = new TJsonNumber { Value = 0 } },
 
                 //  
-                new TJsonObjectValue { Key = "freeze_until_date", Value = new TJsonNumber { Value = 0 } },
 
                 // Specifies the name of the service providing GIF search through gif_search_username (string)
                 new TJsonObjectValue { Key = "gif_search_branding", Value = new TJsonString { Value = "tenor" } },

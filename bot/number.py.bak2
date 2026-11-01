@@ -1,0 +1,74 @@
+import asyncio, random
+from aiogram import F
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from admin import mongo
+
+_lock = asyncio.Lock()
+
+FUNCTIONS_TEXT = ("Что умеет бот Крикграма:\n"
+                  "/start - главное меню\n"
+                  "/number - получить бесплатный номер для входа (до 2 на человека)\n"
+                  "/shop - купить звёзды Крикграма за звёзды Telegram\n"
+                  "/help - этот список\n\n"
+                  "Коды входа в приложение приходят сюда, в бота.")
+
+def register(dp, get_numbers, add_number, max_numbers):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🎲 Получить случайный номер", callback_data="num:random")]])
+
+    async def cmd_number(m: Message):
+        await m.answer("Бесплатный номер для входа в Крикграм, до %d номеров на человека." % max_numbers,
+                       reply_markup=kb, parse_mode=None)
+
+    async def cb_random(c: CallbackQuery):
+        await c.answer()
+        async with _lock:
+            if len(await get_numbers(c.from_user.id)) >= max_numbers:
+                return await c.message.answer("Лимит номеров исчерпан (%d)." % max_numbers, parse_mode=None)
+            for _ in range(20):
+                cc, ln = random.choice([("7", 10), ("380", 9), ("375", 9), ("1", 10), ("44", 10), ("49", 10), ("90", 10)])
+                n = cc + str(random.randint(2, 9)) + "".join(random.choice("0123456789") for _ in range(ln - 1))
+                js = ("const n='%s';"
+                      "if(db.allowed_phones.countDocuments({_id:n})||"
+                      "db['eventflow-userreadmodel'].countDocuments({PhoneNumber:{$in:[n,'+'+n]}}))print('TAKEN');"
+                      "else{db.allowed_phones.insertOne({_id:n,issued:new Date()});print('OK')}") % n
+                code, out = await mongo(js)
+                last = out.strip().splitlines()[-1] if out.strip() else ""
+                if code == 0 and last == "OK":
+                    res = await add_number(c.from_user.id, "+" + n, c.bot.id)
+                    if res in ("ok", "exists"):
+                        return await c.message.answer(
+                            "✅ Твой номер: +%s\nВведи его в приложении Крикграма, код придёт сюда в бота." % n,
+                            parse_mode=None)
+                    await mongo("db.allowed_phones.deleteOne({_id:'%s'})" % n)
+                    return await c.message.answer("Не удалось привязать номер (%s)." % res, parse_mode=None)
+                if code != 0:
+                    break
+            await c.message.answer("Сейчас не получилось выдать номер, попробуй позже.", parse_mode=None)
+
+    async def cmd_help(m: Message):
+        await m.answer(FUNCTIONS_TEXT, parse_mode=None)
+
+    async def cb_help(c: CallbackQuery):
+        await c.answer()
+        await c.message.answer(FUNCTIONS_TEXT, parse_mode=None)
+
+    dp.message.register(cmd_number, Command("number"))
+    dp.message.register(cmd_help, Command("help"))
+    dp.callback_query.register(cb_random, F.data == "num:random")
+    dp.callback_query.register(cb_help, F.data == "menu:help")
+
+def register_start(dp, get_lang, get_numbers, status_text, numbers_keyboard):
+    async def cmd_start(m: Message):
+        lang = await get_lang(m.from_user.id, m.from_user.language_code)
+        nums = await get_numbers(m.from_user.id)
+        base = numbers_keyboard(nums, lang)
+        btn = InlineKeyboardButton(text="🎲 Получить случайный номер", callback_data="num:random")
+        shop_btn = InlineKeyboardButton(text="⭐ Магазин звёзд", callback_data="shop:stars")
+        help_btn = InlineKeyboardButton(text="ℹ️ Функции бота", callback_data="menu:help")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[btn], [shop_btn], [help_btn]] + list(base.inline_keyboard))
+        await m.answer("Бесплатный номер для входа в Крикграм. Нажми кнопку ниже.\n\n" + status_text(nums, lang),
+                       reply_markup=kb)
+
+    dp.message.register(cmd_start, Command("start"))

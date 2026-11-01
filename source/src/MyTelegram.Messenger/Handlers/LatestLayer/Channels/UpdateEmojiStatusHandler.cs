@@ -63,9 +63,10 @@ internal sealed class UpdateEmojiStatusHandler(
 
                 // The collectible must be owned by the user setting it, otherwise anyone could
                 // decorate their channel with somebody else's gift.
+                var wearChannelId = channel.PeerId;
                 var doc = await mongoDatabase.GetCollection<UniqueStarGiftDocument>("unique-star-gifts")
                     .Find(d => d.UniqueId == collectible.CollectibleId
-                               && d.OwnerUserId == input.UserId
+                               && (d.OwnerUserId == input.UserId || d.OwnerChannelId == wearChannelId)
                                && !d.Burned)
                     .FirstOrDefaultAsync();
                 if (doc == null)

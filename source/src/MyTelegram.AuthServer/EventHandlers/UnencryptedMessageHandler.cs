@@ -66,9 +66,21 @@ public class UnencryptedMessageHandler(
                 Step1Results[eventData.ConnectionId] = resPq;
                 _ = Task.Delay(options.CurrentValue.AuthStep1DelayMs).ContinueWith(async _ =>
                 {
-                    if (Step1Results.Remove(eventData.ConnectionId, out var newResPq))
+                    try
                     {
-                        await SendUnencryptResultToClientAsync(eventData, newResPq);
+                        if (Step1Results.Remove(eventData.ConnectionId, out var newResPq))
+                        {
+                            await SendUnencryptResultToClientAsync(eventData, newResPq);
+                            logger.LogInformation("Step1 resPQ sent, connectionId: {ConnectionId}, reqMsgId: {ReqMsgId}", eventData.ConnectionId, eventData.MessageId);
+                        }
+                        else
+                        {
+                            logger.LogWarning("Step1 resPQ was replaced or missing, connectionId: {ConnectionId}, reqMsgId: {ReqMsgId}", eventData.ConnectionId, eventData.MessageId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Step1 resPQ send failed, connectionId: {ConnectionId}, reqMsgId: {ReqMsgId}", eventData.ConnectionId, eventData.MessageId);
                     }
                 });
 

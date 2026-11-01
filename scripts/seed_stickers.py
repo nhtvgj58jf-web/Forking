@@ -941,7 +941,7 @@ def update_metadata_collections(db, manifest: List[Dict[str, Any]]) -> None:
         premium_promo_col.insert_many(premium_promo_docs)
 
     print(
-        f"Updated emoji metadata: keywords={len(emoji_keyword_docs)}, groups={len(emoji_group_docs)}, "
+        f"Updated emoji metadata: groups={len(emoji_group_docs)}, "
         f"featured_emoji_sets={len(featured_docs)}, featured_sets={len(featured_regular_docs)}, "
         f"premium_promo={len(premium_promo_docs)}"
     )

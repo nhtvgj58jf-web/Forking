@@ -27,6 +27,11 @@ if [[ ! "$STARS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+if [ "${#STARS}" -gt 7 ] || [ "$STARS" -gt 1000000 ]; then
+    echo "❌ Error: max 1000000 stars per grant" >&2
+    exit 1
+fi
+
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/compose-helper.sh"
 
 echo "⭐ Giving $STARS stars to user $USER_ID..."
@@ -45,6 +50,7 @@ if (users.countDocuments({ UserId: userId }) === 0) {
 const balances = db.getCollection('star-balances');
 const beforeDoc = balances.findOne({ UserId: userId });
 const before = beforeDoc && beforeDoc.Balance != null ? NumberLong(beforeDoc.Balance.toString()) : NumberLong(0);
+if (Number(before.toString()) + Number(delta.toString()) > 2000000000) { print('ERROR:TOO_MUCH'); quit(3); }
 
 const afterDoc = balances.findOneAndUpdate(
   { UserId: userId },
@@ -66,7 +72,7 @@ db.getCollection('star-transactions').insertOne({
   Refund: false,
   PeerUserId: null,
   PeerChannelId: null,
-  Title: 'Manual stars grant',
+  Title: 'CrikGram',
   Description: 'Added by scripts/give-stars.sh',
   StargiftUpgrade: false,
   StargiftAuctionBid: false,

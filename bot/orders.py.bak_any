@@ -1,0 +1,219 @@
+"""Заявки на покупку анонимного номера и NFT-юзернейма: владелец сам выставляет цену, потом покупатель платит звёздами Telegram."""
+import asyncio, random, re, time
+import aiosqlite
+from aiogram import F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           LabeledPrice, Message, PreCheckoutQuery)
+from admin import run, mongo, tail, issue, ADMIN_IDS, SCRIPTS
+import shop
+
+NICK = re.compile(r"[a-z0-9_]{4,32}")
+ORD = re.compile(r"ord:(\d{1,9})")
+TITLES = {"num": "Анонимный номер 888", "nft": "NFT-юзернейм"}
+WAIT_SECONDS = 600
+waiting = {}   # tg_id -> когда начали ждать ник
+pending = {}   # tg_id -> выбранный ник, пока выбирается аккаунт
+_lock = asyncio.Lock()
+_bind = None
+
+SCHEMA = ("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, tg_name TEXT, "
+          "kind TEXT, nick TEXT, phone TEXT, price INTEGER, status TEXT, charge TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP)")
+COLS = "id,tg_id,tg_name,kind,nick,phone,price,status"
+
+async def dbq(sql, args=(), mode="count"):
+    async with aiosqlite.connect(shop.SHOP_DB) as db:
+        await db.execute(SCHEMA)
+        cur = await db.execute(sql, args)
+        res = {"one": lambda: cur.fetchone(), "all": lambda: cur.fetchall()}.get(mode)
+        res = await res() if res else (cur.lastrowid if mode == "last" else cur.rowcount)
+        await db.commit()
+        return res
+
+async def get_order(oid):
+    r = await dbq("SELECT %s FROM orders WHERE id=?" % COLS, (oid,), "one")
+    return dict(zip(COLS.split(","), r)) if r else None
+
+def who(u):
+    return "%s (%s, tg %s)" % (u.full_name, "@" + u.username if u.username else "без ника", u.id)
+
+def what(o):
+    return TITLES[o["kind"]] + (" @%s" % o["nick"] if o["nick"] else "")
+
+async def create(bot, user, kind, nick=None, phone=None):
+    oid = await dbq("INSERT INTO orders (tg_id,tg_name,kind,nick,phone,status) VALUES (?,?,?,?,?,'new')",
+                    (user.id, who(user), kind, nick, phone), "last")
+    o = await get_order(oid)
+    await shop.notify(bot, "🛒 Заявка #%d: %s\nОт: %s\nВыставить цену: /price %d <звёзд Telegram>\nОтклонить: /decline %d"
+                      % (oid, what(o), o["tg_name"], oid, oid))
+    return oid
+
+async def gen_number():
+    for _ in range(20):
+        n = "888" + "%08d" % random.randint(0, 99999999)
+        js = ("const n='%s';print(db.allowed_phones.countDocuments({_id:n})||"
+              "db['eventflow-userreadmodel'].countDocuments({PhoneNumber:{$in:[n,'+'+n]}})?'TAKEN':'OK')") % n
+        code, out = await mongo(js)
+        if code == 0 and out.strip().splitlines()[-1:] == ["OK"]:
+            return n
+    return None
+
+async def check_pre(q: PreCheckoutQuery):
+    mt = ORD.fullmatch(q.invoice_payload or "")
+    o = await get_order(int(mt.group(1))) if mt else None
+    return bool(o and o["status"] == "priced" and o["tg_id"] == q.from_user.id
+                and o["price"] == q.total_amount and q.currency == "XTR")
+
+async def on_paid(m: Message):
+    p = m.successful_payment
+    oid = int(ORD.fullmatch(p.invoice_payload).group(1)) if ORD.fullmatch(p.invoice_payload or "") else 0
+    o = await get_order(oid) if oid else None
+    charge = p.telegram_payment_charge_id
+    if not o or o["tg_id"] != m.from_user.id:
+        return await shop.notify(m.bot, "Платёж по неизвестной заявке: %s от %s, charge %s" % (p.invoice_payload, m.from_user.id, charge))
+    if not await shop.db_exec("INSERT OR IGNORE INTO payments (charge_id,tg_id,phone,paid,credited,status) VALUES (?,?,?,?,0,'paid')",
+                              (charge, m.from_user.id, "ord:%d" % oid, p.total_amount)):
+        return  # этот платёж уже обработан
+    if not await dbq("UPDATE orders SET status='paid', charge=? WHERE id=? AND status='priced'", (charge, oid)):
+        return await shop.notify(m.bot, "Платёж по заявке #%d в неожиданном статусе (%s), charge %s" % (oid, o["status"], charge))
+    async with _lock:
+        if o["kind"] == "num":
+            n = await gen_number()
+            if not n:
+                code, out = 1, "не удалось подобрать номер"
+            else:
+                code, out = await issue(n)
+                if code == 0:
+                    o["nick"] = n
+                    await _bind(m.from_user.id, "+" + n, m.bot.id)
+        else:
+            uid = await shop.resolve_user(o["phone"])
+            code, out = (1, "аккаунт не найден") if not uid else await run(
+                "bash", "%s/assign-nft-username.sh" % SCRIPTS, uid, o["nick"])
+    if code == 0:
+        await dbq("UPDATE orders SET status='done'" + (", nick=?" if o["kind"] == "num" else "") + " WHERE id=?",
+                  ((o["nick"], oid) if o["kind"] == "num" else (oid,)))
+        text = ("✅ Твой номер: +%s\nВведи его в приложении Крикграма, код придёт сюда в бота." % o["nick"]
+                if o["kind"] == "num" else "✅ Юзернейм @%s выдан на аккаунт +%s." % (o["nick"], o["phone"]))
+        await m.answer(text, parse_mode=None)
+        await shop.notify(m.bot, "✅ Заявка #%d выполнена: %s, цена %d ⭐ Telegram, %s" % (oid, what(o), p.total_amount, o["tg_name"]))
+    else:
+        await dbq("UPDATE orders SET status='failed' WHERE id=?", (oid,))
+        await m.answer("Платёж получен, но выдача задержалась. Мы всё исправим.", parse_mode=None)
+        await shop.notify(m.bot, "ОШИБКА выдачи по заявке #%d (%s)\n%s\ncharge: %s\n%s"
+                          % (oid, what(o), o["tg_name"], charge, tail(out, 6)))
+
+def register(dp, get_numbers, bind_number):
+    global _bind
+    _bind = bind_number
+    async def cb_num(c: CallbackQuery):
+        await c.answer()
+        if await dbq("SELECT id FROM orders WHERE tg_id=? AND kind='num' AND status IN ('new','priced')", (c.from_user.id,), "one"):
+            return await c.message.answer("У тебя уже есть открытая заявка на номер. Дождись цены от владельца.", parse_mode=None)
+        await create(c.bot, c.from_user, "num")
+        await c.message.answer("Заявка на анонимный номер отправлена. Владелец назначит цену, я пришлю её сюда.", parse_mode=None)
+
+    async def cb_nft(c: CallbackQuery):
+        await c.answer()
+        if not await get_numbers(c.from_user.id):
+            return await c.message.answer("Сначала получи номер аккаунта через /start.", parse_mode=None)
+        if await dbq("SELECT id FROM orders WHERE tg_id=? AND kind='nft' AND status IN ('new','priced')", (c.from_user.id,), "one"):
+            return await c.message.answer("У тебя уже есть открытая заявка на юзернейм. Дождись цены от владельца.", parse_mode=None)
+        waiting[c.from_user.id] = time.time()
+        await c.message.answer("Напиши NFT-юзернейм, который хочешь купить (латиница, цифры и _, от 4 символов).", parse_mode=None)
+
+    def is_waiting(m):
+        return bool(m.from_user and time.time() - waiting.get(m.from_user.id, 0) < WAIT_SECONDS)
+
+    async def finish_nft(bot, user, nick, digits, reply):
+        await create(bot, user, "nft", nick=nick, phone=digits)
+        await reply("Заявка на @%s отправлена. Владелец назначит цену, я пришлю её сюда." % nick, parse_mode=None)
+
+    async def on_nick(m: Message):
+        nick = (m.text or "").strip().lstrip("@").lower()
+        if not NICK.fullmatch(nick):
+            return await m.answer("Нужны латиница, цифры и _, от 4 до 32 символов. Попробуй ещё раз.", parse_mode=None)
+        js = ("const n='%s';if(!db.fragment_collectibles.countDocuments({type:'username',username:n}))print('NONE');"
+              "else if(db['eventflow-userreadmodel'].countDocuments({$or:[{UserName:n},{'Usernames.Username':n}]}))print('TAKEN');"
+              "else print('OK')") % nick
+        code, out = await mongo(js)
+        res = out.strip().splitlines()[-1] if code == 0 and out.strip() else "ERR"
+        if res == "NONE":
+            return await m.answer("Такого NFT-юзернейма нет в каталоге. Напиши другой.", parse_mode=None)
+        if res == "TAKEN":
+            return await m.answer("Этот юзернейм уже занят. Напиши другой.", parse_mode=None)
+        if res != "OK":
+            return await m.answer("Не получилось проверить юзернейм, попробуй позже.", parse_mode=None)
+        waiting.pop(m.from_user.id, None)
+        nums = [re.sub(r"\D", "", x) for x in await get_numbers(m.from_user.id)]
+        if len(nums) == 1:
+            return await finish_nft(m.bot, m.from_user, nick, nums[0], m.answer)
+        pending[m.from_user.id] = nick
+        rows = [[InlineKeyboardButton(text="+" + d, callback_data="oa:" + d)] for d in nums]
+        await m.answer("На какой аккаунт выдать @%s?" % nick, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode=None)
+
+    async def cb_account(c: CallbackQuery):
+        d = c.data.split(":", 1)[1]
+        nick = pending.pop(c.from_user.id, None)
+        mine = [re.sub(r"\D", "", x) for x in await get_numbers(c.from_user.id)]
+        if not nick or d not in mine:
+            return await c.answer("Начни заново через /start", show_alert=True)
+        await c.answer()
+        await finish_nft(c.bot, c.from_user, nick, d, c.message.answer)
+
+    async def cb_pay(c: CallbackQuery):
+        o = await get_order(int(c.data.split(":")[1]))
+        if not o or o["tg_id"] != c.from_user.id or o["status"] != "priced":
+            return await c.answer("Заявка недоступна", show_alert=True)
+        await c.message.answer_invoice(title=what(o), description="Заявка #%d" % o["id"], payload="ord:%d" % o["id"],
+                                       currency="XTR", prices=[LabeledPrice(label="Оплата", amount=o["price"])])
+        await c.answer()
+
+    async def cmd_orders(m: Message):
+        rows = await dbq("SELECT %s FROM orders WHERE status IN ('new','priced','failed') ORDER BY id" % COLS, (), "all")
+        lines = []
+        for r in rows:
+            o = dict(zip(COLS.split(","), r))
+            lines.append("#%d %s | %s | %s%s" % (o["id"], what(o), o["tg_name"], o["status"], " %d⭐" % o["price"] if o["price"] else ""))
+        await m.answer("\n".join(lines) or "Открытых заявок нет.", parse_mode=None)
+
+    async def cmd_price(m: Message, command: CommandObject):
+        a = (command.args or "").split()
+        if len(a) != 2 or not a[0].isdigit() or not a[1].isdigit() or int(a[1]) < 1:
+            return await m.answer("/price <номер заявки> <цена в звёздах Telegram>", parse_mode=None)
+        o = await get_order(int(a[0]))
+        if not o or o["status"] not in ("new", "priced"):
+            return await m.answer("Заявка не найдена или уже закрыта.", parse_mode=None)
+        price = int(a[1])
+        await dbq("UPDATE orders SET price=?, status='priced' WHERE id=?", (price, o["id"]))
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Оплатить %d ⭐" % price, callback_data="op:%d" % o["id"])]])
+        try:
+            await m.bot.send_message(o["tg_id"], "Цена по заявке #%d (%s): %d ⭐ Telegram." % (o["id"], what(o), price),
+                                     reply_markup=kb, parse_mode=None)
+        except Exception as e:
+            return await m.answer("Цена сохранена, но написать покупателю не вышло: %s" % e, parse_mode=None)
+        await m.answer("Цена %d ⭐ отправлена покупателю." % price, parse_mode=None)
+
+    async def cmd_decline(m: Message, command: CommandObject):
+        a = (command.args or "").split(None, 1)
+        if not a or not a[0].isdigit():
+            return await m.answer("/decline <номер заявки> [причина]", parse_mode=None)
+        o = await get_order(int(a[0]))
+        if not o or o["status"] not in ("new", "priced"):
+            return await m.answer("Заявка не найдена или уже закрыта.", parse_mode=None)
+        await dbq("UPDATE orders SET status='declined' WHERE id=?", (o["id"],))
+        try:
+            await m.bot.send_message(o["tg_id"], "Заявка #%d (%s) отклонена.%s" % (o["id"], what(o), " Причина: " + a[1] if len(a) > 1 else ""), parse_mode=None)
+        except Exception:
+            pass
+        await m.answer("Заявка отклонена.", parse_mode=None)
+
+    adm = F.from_user.id.in_(ADMIN_IDS)
+    dp.message.register(cmd_orders, Command("orders"), adm)
+    dp.message.register(cmd_price, Command("price"), adm)
+    dp.message.register(cmd_decline, Command("decline"), adm)
+    dp.callback_query.register(cb_num, F.data == "ord:num")
+    dp.callback_query.register(cb_nft, F.data == "ord:nft")
+    dp.callback_query.register(cb_account, F.data.startswith("oa:"))
+    dp.callback_query.register(cb_pay, F.data.startswith("op:"))
+    dp.message.register(on_nick, F.text, F.func(is_waiting))

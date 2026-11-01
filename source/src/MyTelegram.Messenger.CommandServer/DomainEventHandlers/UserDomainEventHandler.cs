@@ -26,7 +26,7 @@ public class UserDomainEventHandler(
 
         if (!domainEvent.AggregateEvent.Bot)
         {
-            var welcomeMessage = "Welcome to Testgram (fork MyTelegram) 🎉\n\nYour account has been successfully created.\n\nRepository: https://github.com/glebxdlolreal/testgram";
+            var welcomeMessage = "Welcome to crikGram! 🎉🎉🎉\n\nYour account has been successfully created.\n\nTGK: https://t.me/crikGram\n\nTCR: https://t.me/OfficialCrikgram";
             var sendMessageInput = new SendMessageInput(
                 RequestInfo.Empty with
                 {

@@ -22,7 +22,7 @@ namespace MyTelegram.Messenger.Handlers.LatestLayer.Auth;
 /// <remarks>
 /// Access: [User ✔] [Bot ✖] [Anonymous ✔]
 /// </remarks>
-internal sealed class SendCodeHandler(ICommandBus commandBus, IPeerHelper peerHelper, IOptionsMonitor<MyTelegramMessengerServerOptions> options, IQueryProcessor queryProcessor, ICacheManager<FutureAuthTokenCacheItem> cacheManager, IHashHelper hashHelper, ICountryHelper countryHelper, ICacheHelper<long, long> cacheHelper, IScheduleAppService scheduleAppService, ILayeredService<IAuthorizationConverter> authorizationLayeredService, IUserConverterService userConverterService, IVerificationCodeGenerator verificationCodeGenerator, IEventBus eventBus) : RpcResultObjectHandler<Schema.Auth.RequestSendCode, Schema.Auth.ISentCode>
+internal sealed class SendCodeHandler(ICommandBus commandBus, IPeerHelper peerHelper, IOptionsMonitor<MyTelegramMessengerServerOptions> options, IQueryProcessor queryProcessor, ICacheManager<FutureAuthTokenCacheItem> cacheManager, IHashHelper hashHelper, ICountryHelper countryHelper, ICacheHelper<long, long> cacheHelper, IScheduleAppService scheduleAppService, ILayeredService<IAuthorizationConverter> authorizationLayeredService, IUserConverterService userConverterService, IVerificationCodeGenerator verificationCodeGenerator, IEventBus eventBus, MongoDB.Driver.IMongoDatabase mongoDatabase) : RpcResultObjectHandler<Schema.Auth.RequestSendCode, Schema.Auth.ISentCode>
 {
     private readonly int _maxFutureAuthTokens = 20;
     protected override async Task<ISentCode> HandleCoreAsync(IRequestInput input, RequestSendCode obj)
@@ -30,7 +30,22 @@ internal sealed class SendCodeHandler(ICommandBus commandBus, IPeerHelper peerHe
         // Android:12222222222 Tdesktop:+1 222 222 2222
         var phoneNumber = obj.PhoneNumber.ToPhoneNumber();
         CheckPhoneNumber(phoneNumber);
+        var bannedCount = await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("banned_phones")
+            .CountDocumentsAsync(MongoDB.Driver.Builders<MongoDB.Bson.BsonDocument>.Filter.Eq("_id", phoneNumber));
+        if (bannedCount > 0)
+        {
+            RpcErrors.RpcErrors400.PhoneNumberBanned.ThrowRpcError();
+        }
         var userReadModel = await queryProcessor.ProcessAsync(new GetUserByPhoneNumberQuery(phoneNumber));
+        if (userReadModel == null)
+        {
+            var allowed = await mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("allowed_phones")
+                .CountDocumentsAsync(MongoDB.Driver.Builders<MongoDB.Bson.BsonDocument>.Filter.Eq("_id", phoneNumber));
+            if (allowed == 0)
+            {
+                RpcErrors.RpcErrors400.PhoneNumberInvalid.ThrowRpcError();
+            }
+        }
         if (userReadModel != null)
         {
             if (peerHelper.IsBotUser(userReadModel.UserId) || userReadModel.UserId == MyTelegramConsts.NotificationServiceUserId)

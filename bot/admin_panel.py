@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Crikgram admin panel. One file, aiohttp (already in the bot's .venv).
+
+Run:   cd /root/testgram-src/bot && .venv/bin/python admin_panel.py
+Needs: PANEL_PASSWORD in bot/.env (the panel refuses to start without it).
+Listens on 127.0.0.1 only. Open it through an SSH tunnel:
+       ssh -L 8088:127.0.0.1:8088 root@<server-ip>   ->  http://127.0.0.1:8088
+"""
+import asyncio, hashlib, hmac, json, os, re, secrets, sqlite3
+from asyncio.subprocess import PIPE
+from aiohttp import web
+
+BASE = "/root/testgram-src"
+COMPOSE = f"{BASE}/docker/compose"
+SCRIPTS = f"{BASE}/scripts"
+CODES_DB = f"{BASE}/bot/codes.db"
+MONGO = "compose-mongodb-1"
+PORT = int(os.environ.get("PANEL_PORT", "8088"))
+USERS = 'db.getCollection("eventflow-userreadmodel")'
+KEYS = 'db.getCollection("eventflow-authkeyreadmodel")'
+CHANNELS = 'db.getCollection("eventflow-channelreadmodel")'
+FLAGS = {"verified": "Verified", "scam": "Scam", "fake": "Fake", "premium": "Premium"}
+
+
+def load_env():
+    try:
+        for line in open(f"{BASE}/bot/.env", encoding="utf-8"):
+            k, _, v = line.strip().partition("=")
+            if k and not k.startswith("#"):
+                os.environ.setdefault(k, v.strip().strip("'\""))
+    except OSError:
+        pass
+
+
+load_env()
+PASSWORD = os.environ.get("PANEL_PASSWORD", "")
+SECRET = secrets.token_bytes(32)
+TOKEN = hmac.new(SECRET, b"ok", hashlib.sha256).hexdigest()
+
+
+async def run(*cmd, cwd=None):
+    p = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE, cwd=cwd)
+    out, err = await p.communicate()
+    if p.returncode:
+        raise RuntimeError((err or out).decode(errors="replace")[-300:])
+    return out.decode(errors="replace").strip()
+
+
+async def mongo(js):
+    return await run("docker", "exec", MONGO, "mongosh", "tg", "--quiet", "--eval", js)
+
+
+def uid(d):
+    return int(d["user_id"])  # ValueError on garbage -> 400
+
+
+LIST_JS = """
+const num=x=>(x&&x.toNumber)?x.toNumber():x;
+const st={}; db.user_status.find().forEach(s=>{st[num(s.UserId)]=s});
+const allowed=new Set(db.allowed_phones.find().toArray().map(d=>d._id));
+const banned=new Set(db.banned_phones.find().toArray().map(d=>d._id));
+const out=%s.find({},{UserId:1,PhoneNumber:1,FirstName:1,LastName:1,UserName:1,Verified:1,Scam:1,Fake:1,Premium:1,IsDeleted:1,CreationTime:1,Bot:1})
+ .sort({CreationTime:-1}).limit(500).toArray().map(u=>{const s=st[num(u.UserId)]||{};
+ return {id:num(u.UserId),phone:u.PhoneNumber,name:[u.FirstName,u.LastName].filter(Boolean).join(" "),
+ username:u.UserName,verified:!!u.Verified,scam:!!u.Scam,fake:!!u.Fake,premium:!!u.Premium,
+ deleted:!!u.IsDeleted,bot:!!u.Bot,created:u.CreationTime,online:!!s.Online,last:s.LastOnline||null,
+ allowed:allowed.has(u.PhoneNumber),banned:banned.has(u.PhoneNumber)}});
+print(JSON.stringify(out))
+""" % USERS
+
+
+CH_JS = """
+const num=x=>(x&&x.toNumber)?x.toNumber():x;
+const b={};
+db.channel_boosts.aggregate([{$group:{_id:"$ChannelId",n:{$sum:{$ifNull:["$Multiplier",1]}}}}]).forEach(g=>{b[num(g._id)]=g.n});
+const out=CHANNELS.find({IsDeleted:{$ne:true}},{ChannelId:1,Title:1,UserName:1,Broadcast:1,MegaGroup:1,Verified:1,ParticipantsCount:1,Date:1})
+ .sort({Date:-1}).limit(500).toArray().map(c=>({id:num(c.ChannelId),title:c.Title,username:c.UserName,
+ kind:c.Broadcast?"channel":(c.MegaGroup?"group":"other"),verified:!!c.Verified,members:c.ParticipantsCount||0,
+ boosts:b[num(c.ChannelId)]||0}));
+print(JSON.stringify(out))
+""".replace("CHANNELS", CHANNELS)
+
+
+def cid(d):
+    return int(d["channel_id"])  # ValueError on garbage -> 400
+
+
+def tg_links():
+    """phone digits -> (tg_id, how many numbers this tg_id has). Helps spot multi-accounts."""
+    try:
+        con = sqlite3.connect(f"file:{CODES_DB}?mode=ro", uri=True)
+        rows = con.execute("SELECT tg_id, phone FROM user_numbers").fetchall()
+        con.close()
+    except Exception:
+        return {}
+    count = {}
+    for tg, _ in rows:
+        count[tg] = count.get(tg, 0) + 1
+    return {re.sub(r"\D", "", str(p)): (tg, count[tg]) for tg, p in rows}
+
+
+async def api_users(req):
+    users = json.loads(await mongo(LIST_JS) or "[]")
+    links = tg_links()
+    for u in users:
+        tg = links.get(u["phone"])
+        u["tg"], u["tg_count"] = tg if tg else (None, 0)
+    return web.json_response(users)
+
+
+async def api_channels(req):
+    return web.json_response(json.loads(await mongo(CH_JS) or "[]"))
+
+
+async def api_cverify(req):
+    d = await req.json()
+    val = "true" if d["value"] else "false"
+    await mongo(f'{CHANNELS}.updateOne({{ChannelId:NumberLong("{cid(d)}")}},{{$set:{{Verified:{val}}}}})')
+    return web.json_response({"ok": True, "needs_apply": True})
+
+
+async def api_cboosts(req):
+    """Sets boosts given from the panel (replaces earlier panel boosts, 0 removes them).
+    GetBoostsStatus reads channel_boosts straight from Mongo, no restart needed."""
+    d = await req.json()
+    n = int(d["amount"])
+    if not 0 <= n <= 1_000_000:
+        raise ValueError
+    c = f'NumberLong("{cid(d)}")'
+    js = f'db.channel_boosts.deleteMany({{ChannelId:{c},Admin:true}});'
+    if n:
+        js += (f'db.channel_boosts.insertOne({{ChannelId:{c},UserId:NumberLong(0),'
+               f'Multiplier:NumberInt({n}),Admin:true,Date:new Date()}});')
+    await mongo(js)
+    return web.json_response({"ok": True})
+
+
+async def api_flag(req):
+    d = await req.json()
+    field = FLAGS[d["flag"]]
+    val = "true" if d["value"] else "false"
+    await mongo(f'{USERS}.updateOne({{UserId:{uid(d)}}},{{$set:{{{field}:{val}}}}})')
+    return web.json_response({"ok": True, "needs_apply": True})
+
+
+async def api_ban(req):
+    d = await req.json()
+    i = uid(d)
+    reason = json.dumps(str(d.get("reason") or "")[:300])  # bak_reason_marker
+    if d.get("ban"):
+        js = (f'const u={USERS}.findOne({{UserId:{i}}},{{PhoneNumber:1}});'
+              f'db.allowed_phones.deleteOne({{_id:u.PhoneNumber}});'
+              f'db.banned_phones.replaceOne({{_id:u.PhoneNumber}},{{_id:u.PhoneNumber,Reason:{reason},Date:new Date()}},{{upsert:true}});'
+              f'{KEYS}.updateMany({{UserId:{i}}},{{$set:{{IsActive:false}}}});')
+    else:
+        js = (f'const u={USERS}.findOne({{UserId:{i}}},{{PhoneNumber:1}});'
+              f'db.allowed_phones.replaceOne({{_id:u.PhoneNumber}},{{_id:u.PhoneNumber}},{{upsert:true}});'
+              f'db.banned_phones.deleteOne({{_id:u.PhoneNumber}});'
+              f'{KEYS}.updateMany({{UserId:{i}}},{{$set:{{IsActive:true}}}});')
+    await mongo(js)
+    return web.json_response({"ok": True, "needs_apply": True})
+
+
+async def api_stars(req):
+    d = await req.json()
+    n = int(d["amount"])
+    if not 1 <= n <= 1_000_000:
+        raise ValueError
+    out = await run("./give-stars.sh", str(uid(d)), str(n), cwd=SCRIPTS)
+    return web.json_response({"ok": True, "msg": out[-200:]})
+
+
+async def api_allow(req):
+    d = await req.json()
+    digits = re.sub(r"\D", "", str(d["phone"]))
+    if not 5 <= len(digits) <= 15:
+        raise ValueError
+    await mongo(f'db.allowed_phones.replaceOne({{_id:"{digits}"}},{{_id:"{digits}"}},{{upsert:true}})')
+    return web.json_response({"ok": True})
+
+
+async def api_apply(req):
+    await run("docker", "compose", "restart", "messenger-query-server",
+              "messenger-command-server", cwd=COMPOSE)
+    return web.json_response({"ok": True})
+
+
+JSNUM = "const num=x=>(x&&x.toNumber)?x.toNumber():x;\n"
+NFT_LIST_JS = JSNUM + """
+const out=[];
+db.getCollection("unique-star-gifts").find({},{Slug:1,Title:1,Num:1,GiftId:1,OwnerUserId:1,OwnerChannelId:1,Attributes:1}).sort({GiftId:1,Num:1}).forEach(d=>{
+ const a={};(d.Attributes||[]).forEach(x=>{a[x.Type]=x.Name});
+ out.push({slug:d.Slug,title:d.Title,num:d.Num,gift:num(d.GiftId),owner:num(d.OwnerUserId)||0,ch:num(d.OwnerChannelId)||0,model:a.model||"",pattern:a.pattern||"",backdrop:a.backdrop||""});
+});
+print(JSON.stringify(out));
+"""
+OPTS_JS = JSNUM + """
+const out=[],seen={};
+db.getCollection("star-gift-upgrade-config").find(FLT).forEach(d=>{
+ if(d.DocumentId==null)return;const k=d.DocumentId.toString();if(seen[k])return;seen[k]=1;
+ out.push({key:k,name:d.Name||"",r:d.RarityPermille||0});});
+out.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+print(JSON.stringify(out));
+"""
+BACK_JS = JSNUM + """
+const m={};
+db.getCollection("star-gift-upgrade-config").find({Type:"backdrop"}).forEach(d=>{if(d.BackdropId!=null)m[num(d.BackdropId)]={key:String(num(d.BackdropId)),name:d.Name||"",r:d.RarityPermille||0}});
+db.getCollection("unique-star-gifts").find({},{Attributes:1}).forEach(d=>(d.Attributes||[]).forEach(x=>{
+ if(x.Type=="backdrop"&&x.BackdropId!=null&&!m[num(x.BackdropId)])m[num(x.BackdropId)]={key:String(num(x.BackdropId)),name:x.Name||"",r:x.RarityPermille||0}}));
+const out=Object.values(m);out.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+print(JSON.stringify(out));
+"""
+
+
+def nft_set_js(slug, t, key):
+    if t == "backdrop":
+        return JSNUM + """const K=%d,SLUG=%s;const N=db.getCollection("unique-star-gifts");const C=db.getCollection("star-gift-upgrade-config");
+let s=C.findOne({Type:"backdrop",BackdropId:K});
+if(!s||s.CenterColor==null){const d=N.findOne({Attributes:{$elemMatch:{Type:"backdrop",BackdropId:K}}});if(d)s=d.Attributes.find(x=>x.Type=="backdrop"&&num(x.BackdropId)==K);}
+if(!s||s.CenterColor==null){print("ERR nosrc");}else{
+const r=N.updateOne({Slug:SLUG,"Attributes.Type":"backdrop"},{$set:{"Attributes.$.Name":s.Name,"Attributes.$.RarityPermille":s.RarityPermille||0,"Attributes.$.BackdropId":s.BackdropId,"Attributes.$.CenterColor":s.CenterColor,"Attributes.$.EdgeColor":s.EdgeColor,"Attributes.$.PatternColor":s.PatternColor,"Attributes.$.TextColor":s.TextColor}});
+print(r.matchedCount==1?"OK":"ERR nomatch");}""" % (int(key), json.dumps(slug))
+    return JSNUM + """const T=%s,SLUG=%s;const N=db.getCollection("unique-star-gifts");const C=db.getCollection("star-gift-upgrade-config");
+const s=C.findOne({Type:T,DocumentId:NumberLong("%d")});
+if(!s){print("ERR nosrc");}else{
+const r=N.updateOne({Slug:SLUG,"Attributes.Type":T},{$set:{"Attributes.$.Name":s.Name,"Attributes.$.RarityPermille":s.RarityPermille||0,"Attributes.$.DocumentId":s.DocumentId,"Attributes.$.DocumentAccessHash":s.DocumentAccessHash,"Attributes.$.DocumentDate":s.DocumentDate,"Attributes.$.MimeType":s.MimeType,"Attributes.$.DocumentSize":s.DocumentSize,"Attributes.$.DcId":s.DcId}});
+print(r.matchedCount==1?"OK":"ERR nomatch");}""" % (json.dumps(t), json.dumps(slug), int(key))
+
+
+async def api_nfts(req):
+    return web.json_response(json.loads(await mongo(NFT_LIST_JS) or "[]"))
+
+
+async def api_nftopts(req):
+    t = req.query["type"]
+    if t not in ("model", "pattern", "backdrop"):
+        raise ValueError
+    if t == "backdrop":
+        return web.json_response(json.loads(await mongo(BACK_JS) or "[]"))
+    gift = int(req.query.get("gift", "0"))
+    if t == "model":
+        flt = '{Type:"model",GiftId:%d}' % gift
+    elif req.query.get("all") == "1":
+        flt = '{Type:"%s"}' % t
+    else:
+        flt = '{Type:"%s",GiftId:{$in:[%d,0]}}' % (t, gift)
+    return web.json_response(json.loads(await mongo(OPTS_JS.replace("FLT", flt)) or "[]"))
+
+
+async def api_nftset(req):
+    d = await req.json()
+    slug, t, key = str(d["slug"]), str(d["type"]), str(d["key"])
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", slug) or t not in ("model", "pattern", "backdrop"):
+        raise ValueError
+    out = await mongo(nft_set_js(slug, t, key))
+    if "OK" not in out:
+        raise RuntimeError(out[-200:] or "нет ответа")
+    return web.json_response({"ok": True})
+
+
+@web.middleware
+async def guard(req, handler):
+    if req.path not in ("/", "/login"):
+        if not hmac.compare_digest(req.cookies.get("sid", ""), TOKEN):
+            return web.json_response({"error": "auth"}, status=401)
+    try:
+        return await handler(req)
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"error": "bad request"}, status=400)
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def login(req):
+    d = await req.json()
+    if hmac.compare_digest(str(d.get("password", "")), PASSWORD):
+        r = web.json_response({"ok": True})
+        r.set_cookie("sid", TOKEN, httponly=True, samesite="Strict", max_age=86400)
+        return r
+    await asyncio.sleep(1.5)
+    return web.json_response({"error": "wrong"}, status=403)
+
+
+async def index(req):
+    return web.Response(text=PAGE, content_type="text/html")
+
+
+PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Crikgram · пульт</title>
+<style>
+:root{--bg:#0d0f12;--card:#161a1f;--line:#252b33;--tx:#e8e6e1;--mut:#8b929c;--acc:#e8a33d;--ok:#5fbf8a;--bad:#e5645a;--blue:#5aa2e8}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 ui-sans-serif,system-ui,sans-serif}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+header{display:flex;justify-content:space-between;align-items:baseline;padding:18px 16px 6px;max-width:1100px;margin:auto}
+h1{font:600 13px ui-monospace,Menlo,monospace;letter-spacing:.18em;text-transform:uppercase;margin:0;color:var(--acc)}
+.wrap{max-width:1100px;margin:auto;padding:0 16px 60px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:10px 0 16px}
+.tile{background:var(--card);padding:12px 14px}.tile b{display:block;font:600 24px ui-monospace,Menlo,monospace}.tile span{color:var(--mut);font-size:12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+input,button{font:inherit;color:var(--tx);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 12px}
+input{flex:1;min-width:160px}button{cursor:pointer}button:hover{border-color:var(--acc)}
+.view.on,.tab.on{background:var(--acc);color:#111;border-color:var(--acc)}
+.row{display:grid;grid-template-columns:1.6fr 1.1fr 1.6fr auto;gap:10px;align-items:center;padding:12px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:8px}
+.name{font-weight:600}.sub{color:var(--mut);font-size:13px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#444;margin-right:6px}.dot.on{background:var(--ok)}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{padding:4px 9px;font-size:12px;border-radius:99px}
+.chip.on.verified{background:var(--blue);color:#06101a;border-color:var(--blue)}.chip.on.scam,.chip.on.fake{background:var(--bad);color:#190605;border-color:var(--bad)}.chip.on.premium{background:var(--acc);color:#1a1100;border-color:var(--acc)}
+.tag{font-size:12px;padding:2px 8px;border-radius:6px;background:#2a2118;color:var(--acc)}.tag.r{background:#2a1513;color:var(--bad)}
+.act{display:flex;gap:6px}.act button{padding:6px 10px;font-size:13px}.danger:hover{border-color:var(--bad);color:var(--bad)}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--acc);padding:10px 16px;border-radius:8px;display:none}
+#apply{display:none;background:var(--acc);color:#111;border-color:var(--acc)}
+#login{max-width:320px;margin:30vh auto;padding:0 16px;display:flex;flex-direction:column;gap:10px}
+@media(max-width:760px){.row{grid-template-columns:1fr}.act{flex-wrap:wrap}}
+
+#pk{position:fixed;inset:0;background:rgba(0,0,0,.72);overflow:auto;padding:16px;z-index:5}
+#pk .box{max-width:560px;margin:4vh auto;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+#pk .opt{display:flex;justify-content:space-between;width:100%;margin-top:6px;text-align:left}
+</style></head><body>
+<div id="login" hidden><h1>Crikgram · вход</h1><input id="pw" type="password" placeholder="пароль"><button onclick="doLogin()">Войти</button></div>
+<div id="app" hidden>
+<header><h1>Crikgram · пульт</h1><button id="apply" onclick="applyNow()">Применить изменения</button></header>
+<div class="wrap">
+<div class="tiles" id="tiles"></div>
+<div class="bar"><button class="view on" data-v="u" onclick="setV('u')">Люди</button><button class="view" data-v="ch" onclick="setV('ch')">Каналы и группы</button><button class="view" data-v="nft" onclick="setV('nft')">NFT</button></div>
+<div class="bar"><input id="q" placeholder="поиск: имя, @ник, номер, id" oninput="draw()">
+<button class="tab on" data-f="all">Все</button><button class="tab" data-f="online">Онлайн</button>
+<button class="tab" data-f="deleted">Удалённые</button><button class="tab" data-f="banned">Забанены</button>
+<button class="tab" data-f="multi">Допы</button></div>
+<div class="bar"><input id="allow" placeholder="разрешить номер (цифры)"><button onclick="allowNum()">Разрешить</button></div>
+<div id="list"></div></div></div><div id="pk" hidden><div class="box"><div class="bar"><b id="pkt" class="name"></b><button onclick="pkClose()">Закрыть</button></div>
+<div class="bar"><input id="pq" placeholder="поиск" oninput="drawPick()"><button id="pall" onclick="pkAll()">Все варианты</button></div><div id="pl"></div></div></div><div id="toast"></div>
+<script>
+let U=[],C=[],F="all",V="u";
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function toast(t){const e=$("toast");e.textContent=t;e.style.display="block";setTimeout(()=>e.style.display="none",2600)}
+async function api(p,b){const r=await fetch(p,{method:b?"POST":"GET",headers:{"Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});
+ if(r.status==401){show(false);throw 0}const j=await r.json();if(!r.ok){toast(j.error||"ошибка");throw 0}if(j.needs_apply)$("apply").style.display="block";return j}
+function show(ok){$("app").hidden=!ok;$("login").hidden=ok}
+async function doLogin(){const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("pw").value})});
+ if(r.ok){show(true);load()}else toast("неверный пароль")}
+async function load(){if(V=="ch")C=await api("/api/channels");else if(V=="nft")N=await api("/api/nfts");else U=await api("/api/users");draw()}
+function setV(v){V=v;document.querySelectorAll(".view").forEach(x=>x.classList.toggle("on",x.dataset.v==v));$("allow").parentElement.hidden=v!="u";document.querySelectorAll(".tab").forEach(x=>x.hidden=v!="u");load()}
+function drawCh(){
+ $("tiles").innerHTML=[["всего",C.length],["каналов",C.filter(c=>c.kind=="channel").length],["групп",C.filter(c=>c.kind=="group").length],["с галочкой",C.filter(c=>c.verified).length],["с голосами",C.filter(c=>c.boosts>0).length]]
+  .map(t=>`<div class="tile"><b>${t[1]}</b><span>${t[0]}</span></div>`).join("");
+ const q=$("q").value.trim().toLowerCase();
+ const rows=C.filter(c=>!q||[c.title,c.username,c.id].join(" ").toLowerCase().includes(q));
+ $("list").innerHTML=rows.map(c=>`<div class="row"><div><div class="name">${esc(c.title||"без названия")} <span class="tag">${c.kind=="channel"?"канал":c.kind=="group"?"группа":"чат"}</span></div><div class="sub mono">id ${c.id}${c.username?" · @"+esc(c.username):""}</div></div>
+  <div><div class="mono">${c.members} уч.</div><div class="sub">голосов: ${c.boosts}</div></div>
+  <div class="chips"><button class="chip verified ${c.verified?"on":""}" onclick="cverify(${c.id},${!c.verified})">✔ галочка</button></div>
+  <div class="act"><button onclick="cboosts(${c.id},${c.boosts})">🚀 голоса</button></div></div>`).join("")||'<div class="sub">пусто</div>'}
+async function cverify(id,v){await api("/api/cverify",{channel_id:id,value:v});toast("сохранено");load()}
+async function cboosts(id,cur){const n=prompt("Сколько голосов (бустов) выдать каналу/группе "+id+"? Заменит ранее выданные отсюда, 0 убирает. Сейчас всего: "+cur,"10");if(n===null||n==="")return;await api("/api/cboosts",{channel_id:id,amount:n});toast("голоса сохранены");load()}
+function ago(s){if(!s)return"—";const m=(Date.now()-new Date(s))/6e4;return m<2?"только что":m<60?Math.round(m)+" мин":m<1440?Math.round(m/60)+" ч":Math.round(m/1440)+" дн"}
+function draw(){
+ if(V=="ch")return drawCh();
+ if(V=="nft")return drawNft();
+ const day=new Date();day.setUTCHours(0,0,0,0);
+ const on=U.filter(u=>u.online).length,td=U.filter(u=>new Date(u.created)>=day).length;
+ $("tiles").innerHTML=[["всего",U.length],["онлайн",on],["сегодня",td],["удалено",U.filter(u=>u.deleted).length],["забанено",U.filter(u=>u.banned).length],["с галочкой",U.filter(u=>u.verified).length]]
+  .map(t=>`<div class="tile"><b>${t[1]}</b><span>${t[0]}</span></div>`).join("");
+ const q=$("q").value.trim().toLowerCase();
+ const rows=U.filter(u=>{
+  if(F=="online"&&!u.online)return false;if(F=="deleted"&&!u.deleted)return false;
+  if(F=="banned"&&!u.banned)return false;if(F=="multi"&&!(u.tg_count>1))return false;
+  return !q||[u.name,u.username,u.phone,u.id].join(" ").toLowerCase().includes(q)});
+ $("list").innerHTML=rows.map(u=>{
+  const chips=["verified","scam","fake","premium"].map(f=>`<button class="chip ${f} ${u[f]?"on":""}" onclick="flag(${u.id},'${f}',${!u[f]})">${{verified:"✔ галочка",scam:"scam",fake:"fake",premium:"premium"}[f]}</button>`).join("");
+  const tags=(u.deleted?'<span class="tag r">удалён</span> ':"")+(u.banned?'<span class="tag r">бан</span> ':"")+(u.tg_count>1?`<span class="tag">${u.tg_count} номера у tg ${u.tg}</span>`:"");
+  return `<div class="row"><div><div class="name">${esc(u.name||"без имени")} ${tags}</div><div class="sub mono">id ${u.id}${u.username?" · @"+esc(u.username):""}</div></div>
+  <div><div class="mono">+${esc(u.phone)}</div><div class="sub"><span class="dot ${u.online?"on":""}"></span>${u.online?"в сети":ago(u.last)}</div></div>
+  <div class="chips">${chips}</div>
+  <div class="act"><button onclick="stars(${u.id})">⭐</button><button class="danger" onclick="ban(${u.id},${!u.banned})">${u.banned?"Разбан":"Бан"}</button></div></div>`}).join("")||'<div class="sub">пусто</div>'}
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x==b));draw()});
+async function flag(id,f,v){await api("/api/flag",{user_id:id,flag:f,value:v});toast("сохранено");load()}
+async function ban(id,isAllowed){if(isAllowed&&!confirm("Забанить id "+id+"?"))return;let reason="";if(isAllowed){reason=prompt("Причина бана (её увидит пользователь):","")||""}await api("/api/ban",{user_id:id,ban:isAllowed,reason});toast(isAllowed?"забанен":"разбанен");load()}
+async function stars(id){const n=prompt("Сколько звёзд выдать id "+id+"?","100");if(!n)return;await api("/api/stars",{user_id:id,amount:n});toast("звёзды выданы")}
+async function allowNum(){const p=$("allow").value;if(!p)return;await api("/api/allow",{phone:p});$("allow").value="";toast("номер разрешён")}
+async function applyNow(){if(!confirm("Перезапустить query и command серверы? Займёт ~20 секунд."))return;toast("перезапуск…");await api("/api/apply",{});$("apply").style.display="none";toast("готово")}
+let N=[],PK=null;
+function drawNft(){
+ $("tiles").innerHTML=`<div class="tile"><b>${N.length}</b><span>NFT</span></div>`;
+ const q=$("q").value.trim().toLowerCase();
+ const rows=N.filter(n=>!q||[n.slug,n.title,n.owner,n.ch,n.model,n.pattern,n.backdrop].join(" ").toLowerCase().includes(q));
+ $("list").innerHTML=rows.map(n=>`<div class="row" style="grid-template-columns:1fr 2.4fr"><div><div class="name">${esc(n.title)} #${n.num}</div><div class="sub mono">${esc(n.slug)} · ${n.ch?"канал "+n.ch:"id "+n.owner}</div></div>
+ <div class="chips"><button class="chip" onclick="pick('${esc(n.slug)}','model',${n.gift})">модель: ${esc(n.model)}</button><button class="chip" onclick="pick('${esc(n.slug)}','pattern',${n.gift})">узор: ${esc(n.pattern)}</button><button class="chip" onclick="pick('${esc(n.slug)}','backdrop',${n.gift})">фон: ${esc(n.backdrop)}</button></div></div>`).join("")||'<div class="sub">пусто</div>'}
+async function pick(slug,type,gift){PK={slug,type,gift,all:false,opts:[]};$("pq").value="";$("pall").hidden=type!="pattern";$("pkt").textContent=slug+" · "+{model:"модель",pattern:"узор",backdrop:"фон"}[type];$("pk").hidden=false;await loadOpts()}
+async function loadOpts(){PK.opts=await api(`/api/nftopts?type=${PK.type}&gift=${PK.gift}&all=${PK.all?1:0}`);drawPick()}
+function pkAll(){PK.all=!PK.all;$("pall").textContent=PK.all?"Только этого подарка":"Все варианты";loadOpts()}
+function pkClose(){$("pk").hidden=true;PK=null}
+function drawPick(){if(!PK)return;const q=$("pq").value.trim().toLowerCase();
+ $("pl").innerHTML=PK.opts.filter(o=>!q||o.name.toLowerCase().includes(q)).slice(0,400).map(o=>`<button class="opt" onclick="setOpt('${o.key}')"><span>${esc(o.name)}</span><span class="sub">${o.r?o.r/10+"%":""}</span></button>`).join("")||'<div class="sub">нет вариантов</div>'}
+async function setOpt(key){const p=PK;await api("/api/nftset",{slug:p.slug,type:p.type,key});toast("сохранено");pkClose();N=await api("/api/nfts");drawNft()}
+$("pw").addEventListener("keydown",e=>{if(e.key=="Enter")doLogin()});
+fetch("/api/users").then(r=>{if(r.ok){show(true);return r.json().then(j=>{U=j;draw()})}show(false)});
+setInterval(()=>{if(!$("app").hidden&&V!="nft")load().catch(()=>{})},30000);
+</script></body></html>"""
+
+
+def main():
+    if len(PASSWORD) < 8:
+        raise SystemExit("Set PANEL_PASSWORD (8+ chars) in /root/testgram-src/bot/.env")
+    app = web.Application(middlewares=[guard])
+    app.add_routes([web.get("/", index), web.post("/login", login),
+                    web.get("/api/users", api_users), web.post("/api/flag", api_flag),
+                    web.get("/api/channels", api_channels), web.post("/api/cverify", api_cverify),
+                    web.post("/api/cboosts", api_cboosts),
+                    web.post("/api/ban", api_ban), web.post("/api/stars", api_stars),
+                    web.post("/api/allow", api_allow), web.post("/api/apply", api_apply),
+                    web.get("/api/nfts", api_nfts), web.get("/api/nftopts", api_nftopts),
+                    web.post("/api/nftset", api_nftset)])
+    web.run_app(app, host="127.0.0.1", port=PORT)
+
+
+if __name__ == "__main__":
+    main()

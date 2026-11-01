@@ -1,0 +1,241 @@
+using MongoDB.Bson;
+using MongoDB.Driver;
+using MyTelegram.Messenger.Services.StarGifts;
+using MyTelegram.Messenger.Handlers.LatestLayer.Payments;
+using MyTelegram.Schema.Payments;
+
+namespace MyTelegram.Messenger.Handlers.LatestLayer.Payments;
+
+internal sealed class GetSavedStarGiftsHandler(
+    IMongoDatabase mongoDatabase,
+    IUserAppService userAppService,
+    IUserConverterService userConverterService) : RpcResultObjectHandler<RequestGetSavedStarGifts, ISavedStarGifts>
+{
+    protected override async Task<ISavedStarGifts> HandleCoreAsync(IRequestInput input, RequestGetSavedStarGifts obj)
+    {
+        var collection = mongoDatabase.GetCollection<SavedStarGiftDocument>("saved-star-gifts");
+
+        FilterDefinition<SavedStarGiftDocument> filter;
+        bool isOwner;
+        bool isChannel = false;
+        bool? chatNotificationsEnabled = null;
+
+        if (obj.Peer is TInputPeerChannel ch)
+        {
+            isChannel = true;
+            filter = Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerChannelId, ch.ChannelId);
+
+            // Check admin status and fetch channel notification setting
+            var channelDoc = await mongoDatabase.GetCollection<BsonDocument>("eventflow-channelreadmodel")
+                .Find(new BsonDocument("ChannelId", ch.ChannelId))
+                .Project(new BsonDocument { { "AdminList", 1 }, { "ChatNotificationsEnabled", 1 } })
+                .FirstOrDefaultAsync();
+            isOwner = channelDoc?["AdminList"]?.AsBsonArray
+                .Any(a => a["UserId"].AsInt64 == input.UserId) ?? false;
+            if (isOwner && channelDoc?.Contains("ChatNotificationsEnabled") == true)
+                chatNotificationsEnabled = channelDoc["ChatNotificationsEnabled"].IsBsonNull ? null : channelDoc["ChatNotificationsEnabled"].AsNullableBoolean;
+        }
+        else
+        {
+            var targetUserId = obj.Peer switch
+            {
+                TInputPeerSelf => input.UserId,
+                TInputPeerUser u => u.UserId,
+                _ => input.UserId
+            };
+            isOwner = targetUserId == input.UserId;
+            filter = Builders<SavedStarGiftDocument>.Filter.Eq(d => d.OwnerUserId, targetUserId);
+        }
+
+        // Non-owners only see saved (pinned) gifts
+        if (!isOwner) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.Saved, true);
+        if (obj.ExcludeUnsaved) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.Saved, true);
+        if (obj.ExcludeSaved) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.Saved, false);
+        if (obj.ExcludeUnique) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, false);
+        if (obj.ExcludeUnlimited)
+        {
+            var limitedIds = (await mongoDatabase.GetCollection<StarGiftDocument>("star-gifts")
+                .Find(Builders<StarGiftDocument>.Filter.Eq(d => d.Limited, true))
+                .ToListAsync()).Select(d => d.GiftId).ToHashSet();
+            filter &= Builders<SavedStarGiftDocument>.Filter.In(d => d.GiftId, limitedIds);
+        }
+        if (obj.ExcludeUpgradable && obj.ExcludeUnupgradable)
+            filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, true);
+        else
+        {
+            if (obj.ExcludeUpgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.UpgradeStars, null);
+            if (obj.ExcludeUnupgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null);
+        }
+
+        // Filter by collection
+        if (obj.CollectionId.HasValue)
+        {
+            var colDoc = await mongoDatabase.GetCollection<StarGiftCollectionDocument>("star-gift-collections")
+                .Find(StarGiftCollectionHelper.OwnerFilter(isChannel ? 0 : (obj.Peer is TInputPeerSelf ? input.UserId : (obj.Peer is TInputPeerUser u2 ? u2.UserId : input.UserId)), isChannel ? (obj.Peer is TInputPeerChannel ch2 ? ch2.ChannelId : 0) : 0)
+                    & Builders<StarGiftCollectionDocument>.Filter.Eq(x => x.CollectionId, obj.CollectionId.Value))
+                .FirstOrDefaultAsync();
+            if (colDoc != null)
+            {
+                var msgIds = colDoc.Items.Where(i => i.MsgId.HasValue).Select(i => i.MsgId!.Value).ToList();
+                var savedIds = colDoc.Items.Where(i => i.SavedId.HasValue).Select(i => i.SavedId!.Value).ToList();
+                var slugs = colDoc.Items.Where(i => i.Slug != null).Select(i => i.Slug!).ToList();
+                var colFilter = Builders<SavedStarGiftDocument>.Filter.Where(_ => false);
+                foreach (var m in msgIds) colFilter |= SavedStarGiftMsgIdHelper.MatchMsgId(m);
+                if (savedIds.Count > 0) colFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.RandomId, savedIds);
+                if (slugs.Count > 0) colFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.UniqueSlug, slugs);
+                filter &= colFilter;
+            }
+        }
+
+        var total = (int)await collection.CountDocumentsAsync(filter);
+
+        int skip = int.TryParse(obj.Offset, out var parsed) ? parsed : 0;
+        int limit = obj.Limit > 0 ? obj.Limit : 100;
+
+        // Newest gifts first, pinned on top
+        var sortDef = obj.SortByValue
+            ? Builders<SavedStarGiftDocument>.Sort.Descending(d => d.Stars)
+            : Builders<SavedStarGiftDocument>.Sort.Descending(d => d.PinnedToTop).Ascending(d => d.PinOrder).Descending(d => d.Date);
+
+        var docs = await collection.Find(filter)
+            .Sort(sortDef)
+            .Skip(skip).Limit(limit)
+            .ToListAsync();
+
+        string? nextOffset = (skip + docs.Count < total) ? (skip + docs.Count).ToString() : null;
+
+        // Load star-gift metadata
+        var giftIds = docs.Select(d => d.GiftId).Distinct().ToList();
+        var giftMetaById = (await mongoDatabase.GetCollection<StarGiftDocument>("star-gifts")
+            .Find(Builders<StarGiftDocument>.Filter.In(d => d.GiftId, giftIds))
+            .ToListAsync()).ToDictionary(d => d.GiftId);
+
+        // Collect user IDs to resolve into Users list
+        var userIds = docs.Where(d => !d.NameHidden && d.FromUserId != 0).Select(d => d.FromUserId).Distinct().ToList();
+        var userReadModels = userIds.Count > 0 ? await userAppService.GetListAsync(userIds) : [];
+        var usersById = userReadModels.ToDictionary(
+            u => u.UserId,
+            u => (IUser)userConverterService.ToUser(input, u, layer: input.Layer));
+
+        var gifts = new TVector<ISavedStarGift>();
+
+        // Load unique gifts for docs that are upgraded
+        var uniqueSlugs = docs.Where(d => d.IsUnique && d.UniqueSlug != null).Select(d => d.UniqueSlug!).ToList();
+        var uniqueBySlug = uniqueSlugs.Count > 0
+            ? (await mongoDatabase.GetCollection<UniqueStarGiftDocument>("unique-star-gifts")
+                .Find(Builders<UniqueStarGiftDocument>.Filter.In(d => d.Slug, uniqueSlugs))
+                .ToListAsync()).ToDictionary(d => d.Slug)
+            : new Dictionary<string, UniqueStarGiftDocument>();
+
+        var nowForCooldown = DateTime.UtcNow.ToTimestamp();
+        foreach (var doc in docs)
+        {
+            // Layer 223: user-owned gifts are addressed by inputSavedStarGiftUser.msg_id, which is
+            // a 32-bit field. Gifts never anchored to a service message get a stable local id —
+            // casting the 64-bit RandomId here would truncate it and make the gift unaddressable.
+            var msgId = isChannel ? (int?)null : await SavedStarGiftMsgIdHelper.ResolveAsync(mongoDatabase, doc);
+
+            giftMetaById.TryGetValue(doc.GiftId, out var meta);
+
+            IPeer? fromId = null;
+            if (!doc.NameHidden && doc.FromUserId != 0)
+                fromId = new TPeerUser { UserId = doc.FromUserId };
+
+            ITextWithEntities? message = null;
+            if (!string.IsNullOrEmpty(doc.MessageText))
+            {
+                // Item 14: restore preserved entities (custom emoji, bold, etc.) instead of stripping.
+                message = new TTextWithEntities
+                {
+                    Text = doc.MessageText,
+                    Entities = doc.MessageEntities ?? new TVector<IMessageEntity>(),
+                };
+            }
+
+            IStarGift giftTl;
+            if (doc.IsUnique && doc.UniqueSlug != null && uniqueBySlug.TryGetValue(doc.UniqueSlug, out var uniqueDoc))
+            {
+                giftTl = UniqueStarGiftHelper.ToTl(
+                    uniqueDoc,
+                    documentId => CollectibleEmojiStatusHelper.DocumentExists(mongoDatabase, documentId));
+            }
+            else
+            {
+                giftTl = StarGiftTlBuilder.Build(
+                    doc.GiftId,
+                    doc.Stars,
+                    doc.ConvertStars,
+                    doc.UpgradeStars,
+                    new TDocument
+                    {
+                        Id = doc.DocumentId,
+                        AccessHash = doc.DocumentAccessHash,
+                        FileReference = doc.FileReference,
+                        Date = doc.DocumentDate,
+                        MimeType = doc.MimeType,
+                        Size = doc.DocumentSize,
+                        DcId = doc.DcId,
+                        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
+                    },
+                    meta);
+            }
+
+            int? uniqueTransferLockedUntil = null;
+            if (doc.IsUnique && doc.UniqueSlug != null && uniqueBySlug.TryGetValue(doc.UniqueSlug, out var cooldownUniqueDoc))
+                uniqueTransferLockedUntil = cooldownUniqueDoc.TransferLockedUntil;
+            var cooldownAt = LaterTimestamp(doc.CanTransferAt, uniqueTransferLockedUntil);
+            if (cooldownAt.HasValue && cooldownAt.Value <= nowForCooldown) cooldownAt = null;
+            var canResellAt = LaterTimestamp(doc.CanResellAt, cooldownAt);
+            if (canResellAt.HasValue && canResellAt.Value <= nowForCooldown) canResellAt = null;
+            var canCraftAt = LaterTimestamp(doc.CanCraftAt, cooldownAt);
+            if (canCraftAt.HasValue && canCraftAt.Value <= nowForCooldown) canCraftAt = null;
+
+            gifts.Add(new TSavedStarGift
+            {
+                Gift = giftTl,
+                FromId = fromId,
+                Date = doc.Date,
+                Message = message,
+                // Layer 223: user-owned gifts are addressed by inputSavedStarGiftUser.msg_id;
+                // channel-owned gifts are addressed by inputSavedStarGiftChat.saved_id.
+                MsgId = msgId,
+                SavedId = isChannel ? doc.RandomId : null,
+                ConvertStars = doc.IsUnique || doc.IsAuction ? null : (doc.ConvertStars > 0 ? doc.ConvertStars : null),
+                UpgradeStars = !doc.IsUnique && doc.PrepaidUpgrade ? doc.UpgradeStars : null,
+                CanUpgrade = !doc.IsUnique && doc.UpgradeStars.HasValue,
+                Unsaved = !doc.Saved,
+                NameHidden = doc.NameHidden,
+                PinnedToTop = doc.PinnedToTop,
+                GiftNum = doc.GiftNum,
+                PrepaidUpgradeHash = doc.PrepaidUpgradeHash,
+                CanTransferAt = cooldownAt,
+                CanResellAt = canResellAt,
+                CanCraftAt = canCraftAt, // Layer 223+ craft cooldown
+            });
+        }
+
+        var users = new TVector<IUser>(usersById.Values.ToList());
+
+        return new TSavedStarGifts
+        {
+            Count = total,
+            Gifts = gifts,
+            NextOffset = nextOffset,
+            ChatNotificationsEnabled = isOwner ? chatNotificationsEnabled : null,
+            Chats = new TVector<IChat>(),
+            Users = users,
+        };
+    }
+
+    private static int? LaterTimestamp(params int?[] values)
+    {
+        int? result = null;
+        foreach (var value in values)
+        {
+            if (value.HasValue && (!result.HasValue || value.Value > result.Value))
+                result = value.Value;
+        }
+
+        return result;
+    }
+}

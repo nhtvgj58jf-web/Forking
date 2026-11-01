@@ -70,11 +70,25 @@ public static class UpgradeAttributeHelper
         var patterns = attrs.OfType<TStarGiftAttributePattern>().ToList();
         var backdrops = attrs.OfType<TStarGiftAttributeBackdrop>().ToList();
 
-        if (models.Count > 0) result.Add(WeightedRandom(models));
-        if (patterns.Count > 0) result.Add(WeightedRandom(patterns));
-        if (backdrops.Count > 0) result.Add(WeightedRandom(backdrops));
+        // The client spins the upgrade "roulette" through the sample, so it needs several variants of each kind.
+        foreach (var m in PickDistinct(models, 8)) result.Add(m);
+        foreach (var pt in PickDistinct(patterns, 8)) result.Add(pt);
+        foreach (var b in PickDistinct(backdrops, 8)) result.Add(b);
 
         return result;
+    }
+
+    private static List<T> PickDistinct<T>(List<T> items, int count) where T : class
+    {
+        var pool = new List<T>(items);
+        var picked = new List<T>();
+        while (picked.Count < count && pool.Count > 0)
+        {
+            var x = WeightedRandom(pool);
+            picked.Add(x);
+            pool.Remove(x);
+        }
+        return picked;
     }
 
     private static T WeightedRandom<T>(List<T> items) where T : class
@@ -120,7 +134,7 @@ public static class UpgradeAttributeHelper
         FileReference = e.FileReference ?? [], Date = e.DocumentDate ?? 0,
         MimeType = e.MimeType ?? "application/x-tgsticker",
         Size = e.DocumentSize ?? 0, DcId = e.DcId ?? 2,
-        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+        Attributes = [e.Type == "pattern" ? (IDocumentAttribute)new TDocumentAttributeCustomEmoji { Alt = "🎁", Free = true, TextColor = true, Stickerset = new TInputStickerSetEmpty() } : new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
     };
 
     private static IDocument MakeDoc(CraftAttributeConfigEntry e) => new TDocument
@@ -129,7 +143,7 @@ public static class UpgradeAttributeHelper
         FileReference = e.FileReference ?? [], Date = e.DocumentDate ?? 0,
         MimeType = e.MimeType ?? "application/x-tgsticker",
         Size = e.DocumentSize ?? 0, DcId = e.DcId ?? 2,
-        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
     };
 
     private static IDocument MakeGiftDoc(StarGiftDocument gift) => new TDocument
@@ -138,6 +152,6 @@ public static class UpgradeAttributeHelper
         FileReference = gift.FileReference ?? [], Date = gift.DocumentDate,
         MimeType = gift.MimeType ?? "application/x-tgsticker",
         Size = gift.DocumentSize, DcId = gift.DcId,
-        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
     };
 }

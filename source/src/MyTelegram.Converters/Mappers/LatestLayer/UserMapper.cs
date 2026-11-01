@@ -30,8 +30,8 @@ internal sealed class UserMapper
         destination.Phone = source.PhoneNumber;
         destination.FirstName = source.FirstName;
         destination.LastName = source.LastName;
-        destination.Fake = source.Fake;
-        destination.Scam = source.Scam;
+        destination.Fake = source.Fake && source.EmojiStatusDocumentId == null;
+        destination.Scam = source.Scam && source.EmojiStatusDocumentId == null;
         destination.Verified = source.Verified;
         destination.Support = source.Support;
         destination.Premium = source.Premium;

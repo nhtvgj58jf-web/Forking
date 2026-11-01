@@ -293,8 +293,15 @@ internal sealed class TranslateTextHandler(
     /// instead, which is what this handler used to do, is worse still: to every client that is a
     /// successful translation.
     /// </summary>
+    private static readonly bool SendUnavailableNotice = false;
+
     private async Task ReportTranslationsUnavailableAsync(IRequestInput input)
     {
+        if (!SendUnavailableNotice)
+        {
+            return;
+        }
+
         const string message = "Message translation is not available on this server.";
 
         var updates = new TUpdates

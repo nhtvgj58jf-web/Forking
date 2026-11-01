@@ -16,7 +16,8 @@ internal sealed class CreateForumTopicHandler(
     IMongoDatabase mongoDatabase,
     IPeerHelper peerHelper,
     IMessageAppService messageAppService,
-    IChannelAdminRightsChecker channelAdminRightsChecker) : RpcResultObjectHandler<MyTelegram.Schema.Messages.RequestCreateForumTopic, MyTelegram.Schema.IUpdates>
+    IChannelAdminRightsChecker channelAdminRightsChecker,
+    IIdGenerator idGenerator) : RpcResultObjectHandler<MyTelegram.Schema.Messages.RequestCreateForumTopic, MyTelegram.Schema.IUpdates>
 {
     protected override async Task<MyTelegram.Schema.IUpdates> HandleCoreAsync(IRequestInput input,
         MyTelegram.Schema.Messages.RequestCreateForumTopic obj)
@@ -41,17 +42,8 @@ internal sealed class CreateForumTopicHandler(
         if (!await channelAdminRightsChecker.HasChatAdminRightAsync(channelId, input.UserId, p => p.ManageTopics))
             RpcErrors.RpcErrors403.ChatWriteForbidden.ThrowRpcError();
 
-        // Generate topic ID (use message ID counter)
-        var countersCol = mongoDatabase.GetCollection<BsonDocument>("counters");
-        var filter = Builders<BsonDocument>.Filter.Eq("_id", $"message_id_{channelId}");
-        var update = Builders<BsonDocument>.Update.Inc("seq", 1);
-        var options = new FindOneAndUpdateOptions<BsonDocument>
-        {
-            IsUpsert = true,
-            ReturnDocument = ReturnDocument.After
-        };
-        var result = await countersCol.FindOneAndUpdateAsync(filter, update, options);
-        var topicId = result["seq"].AsInt32;
+        // Topic id == id of its creation service message, so it must come from the real per-channel message id sequence.
+        var topicId = await idGenerator.NextIdAsync(IdType.MessageId, channelId);
 
         // Create topic document
         var topicsCol = mongoDatabase.GetCollection<BsonDocument>("forum_topics");

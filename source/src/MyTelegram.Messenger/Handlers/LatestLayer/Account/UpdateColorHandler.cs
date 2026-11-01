@@ -74,7 +74,7 @@ internal sealed class UpdateColorHandler(
             {
                 await commandBus.PublishAsync(new UpdateEmojiStatusCommand(
                     UserId.Create(input.UserId),
-                    input.ToRequestInfo() with { ReqMsgId = 0 },
+                    input.ToRequestInfo() with { ReqMsgId = input.ReqMsgId + 1 },
                     null));
                 userAppService.InvalidateCache(input.UserId);
             }

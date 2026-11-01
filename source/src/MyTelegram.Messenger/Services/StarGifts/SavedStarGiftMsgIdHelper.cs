@@ -37,6 +37,8 @@ public static class SavedStarGiftMsgIdHelper
     public static async Task<int> ResolveAsync(IMongoDatabase database, SavedStarGiftDocument doc)
     {
         if (doc.MessageId > 0) return doc.MessageId;
+        var anchoredMsgId = await TryAnchorToServiceMessageAsync(database, doc);
+        if (anchoredMsgId > 0) return anchoredMsgId;
         if (doc.LocalMsgId > 0) return doc.LocalMsgId;
 
         var localMsgId = await NextLocalMsgIdAsync(database);
@@ -64,6 +66,73 @@ public static class SavedStarGiftMsgIdHelper
             f.And(f.Gt(d => d.MessageId, 0), f.Eq(d => d.MessageId, msgId)),
             f.And(f.Gt(d => d.LocalMsgId, 0), f.Eq(d => d.LocalMsgId, msgId)),
             f.Eq(d => d.RandomId, msgId));
+    }
+
+    /// <summary>
+    /// A gift bought through the store is saved before its service message has an id, so MessageId stays 0.
+    /// When the client addresses it by the real message id, anchor the closest unanchored gift in time.
+    /// </summary>
+    public static async Task<SavedStarGiftDocument?> AnchorByMessageAsync(
+        IMongoCollection<SavedStarGiftDocument> col, long ownerUserId, int msgId)
+    {
+        if (msgId <= 0 || msgId >= LocalMsgIdBase) return null;
+        var msgDoc = await col.Database.GetCollection<BsonDocument>("eventflow-messagereadmodel")
+            .Find(new BsonDocument { { "OwnerPeerId", ownerUserId }, { "MessageId", msgId }, { "SendMessageType", 2 } })
+            .Project(new BsonDocument { { "Date", 1 }, { "MessageAction", 1 } })
+            .FirstOrDefaultAsync();
+        if (msgDoc == null || !msgDoc.Contains("Date") || !msgDoc.Contains("MessageAction") || msgDoc["MessageAction"].IsBsonNull)
+            return null;
+        var msgDate = msgDoc["Date"].ToInt32();
+        var candidates = await col.Find(d => d.OwnerUserId == ownerUserId && d.MessageId == 0 && !d.IsUnique
+            && d.UpgradeStars.HasValue && d.Date >= msgDate - 10 && d.Date <= msgDate + 10).ToListAsync();
+        var best = candidates.OrderBy(d => Math.Abs(d.Date - msgDate)).FirstOrDefault();
+        if (best == null) return null;
+        var res = await col.UpdateOneAsync(d => d.Id == best.Id && d.MessageId == 0,
+            Builders<SavedStarGiftDocument>.Update.Set(d => d.MessageId, msgId));
+        if (res.ModifiedCount == 0) return null;
+        best.MessageId = msgId;
+        return best;
+    }
+
+    /// <summary>
+    /// Anchors an unanchored gift to its real service message (single unused candidate within +-3 s).
+    /// Returns 0 when there is no unambiguous match.
+    /// </summary>
+    private static async Task<int> TryAnchorToServiceMessageAsync(IMongoDatabase database, SavedStarGiftDocument doc)
+    {
+        if (doc.OwnerUserId <= 0 || doc.Date <= 0 || doc.IsUnique) return 0;
+
+        var msgCol = database.GetCollection<BsonDocument>("eventflow-messagereadmodel");
+        var candidates = await msgCol.Find(new BsonDocument
+            {
+                { "OwnerPeerId", doc.OwnerUserId },
+                { "SendMessageType", 2 },
+                { "Date", new BsonDocument { { "$gte", doc.Date - 3 }, { "$lte", doc.Date + 3 } } },
+                { "MessageAction", new BsonDocument("$ne", BsonNull.Value) },
+            })
+            .Project(new BsonDocument { { "MessageId", 1 }, { "Date", 1 } })
+            .ToListAsync();
+        if (candidates.Count == 0) return 0;
+
+        var savedCol = database.GetCollection<SavedStarGiftDocument>("saved-star-gifts");
+        var free = new List<int>();
+        foreach (var c in candidates)
+        {
+            if (!c.Contains("MessageId")) continue;
+            var mid = c["MessageId"].ToInt32();
+            if (mid <= 0 || mid >= LocalMsgIdBase) continue;
+            var taken = await savedCol.CountDocumentsAsync(d => d.OwnerUserId == doc.OwnerUserId && d.MessageId == mid) > 0;
+            if (!taken) free.Add(mid);
+        }
+
+        if (free.Count != 1) return 0;
+
+        var res = await savedCol.UpdateOneAsync(d => d.Id == doc.Id && d.MessageId == 0,
+            Builders<SavedStarGiftDocument>.Update.Set(d => d.MessageId, free[0]));
+        if (res.ModifiedCount == 0) return 0;
+
+        doc.MessageId = free[0];
+        return free[0];
     }
 
     private static async Task<int> NextLocalMsgIdAsync(IMongoDatabase database)

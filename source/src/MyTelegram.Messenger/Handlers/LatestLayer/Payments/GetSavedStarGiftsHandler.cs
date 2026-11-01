@@ -59,8 +59,13 @@ internal sealed class GetSavedStarGiftsHandler(
                 .ToListAsync()).Select(d => d.GiftId).ToHashSet();
             filter &= Builders<SavedStarGiftDocument>.Filter.In(d => d.GiftId, limitedIds);
         }
-        if (obj.ExcludeUpgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.UpgradeStars, null);
-        if (obj.ExcludeUnupgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null);
+        if (obj.ExcludeUpgradable && obj.ExcludeUnupgradable)
+            filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.IsUnique, true);
+        else
+        {
+            if (obj.ExcludeUpgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Eq(d => d.UpgradeStars, null);
+            if (obj.ExcludeUnupgradable) filter &= Builders<SavedStarGiftDocument>.Filter.Ne(d => d.UpgradeStars, null);
+        }
 
         // Filter by collection
         if (obj.CollectionId.HasValue)
@@ -75,8 +80,9 @@ internal sealed class GetSavedStarGiftsHandler(
                 var savedIds = colDoc.Items.Where(i => i.SavedId.HasValue).Select(i => i.SavedId!.Value).ToList();
                 var slugs = colDoc.Items.Where(i => i.Slug != null).Select(i => i.Slug!).ToList();
                 var colFilter = Builders<SavedStarGiftDocument>.Filter.Where(_ => false);
-                if (msgIds.Count > 0) colFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.MessageId, msgIds);
+                foreach (var m in msgIds) colFilter |= SavedStarGiftMsgIdHelper.MatchMsgId(m);
                 if (savedIds.Count > 0) colFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.RandomId, savedIds);
+                if (slugs.Count > 0) colFilter |= Builders<SavedStarGiftDocument>.Filter.In(d => d.UniqueSlug, slugs);
                 filter &= colFilter;
             }
         }
@@ -89,7 +95,7 @@ internal sealed class GetSavedStarGiftsHandler(
         // Newest gifts first, pinned on top
         var sortDef = obj.SortByValue
             ? Builders<SavedStarGiftDocument>.Sort.Descending(d => d.Stars)
-            : Builders<SavedStarGiftDocument>.Sort.Descending(d => d.PinnedToTop).Descending(d => d.Date);
+            : Builders<SavedStarGiftDocument>.Sort.Descending(d => d.PinnedToTop).Ascending(d => d.PinOrder).Descending(d => d.Date);
 
         var docs = await collection.Find(filter)
             .Sort(sortDef)
@@ -134,6 +140,9 @@ internal sealed class GetSavedStarGiftsHandler(
             IPeer? fromId = null;
             if (!doc.NameHidden && doc.FromUserId != 0)
                 fromId = new TPeerUser { UserId = doc.FromUserId };
+            // patchfrom: client needs a sender to build the upgrade reference
+            if (fromId == null && !isChannel && !doc.IsUnique && doc.UpgradeStars.HasValue)
+                fromId = new TPeerUser { UserId = doc.OwnerUserId };
 
             ITextWithEntities? message = null;
             if (!string.IsNullOrEmpty(doc.MessageText))
@@ -169,7 +178,7 @@ internal sealed class GetSavedStarGiftsHandler(
                         MimeType = doc.MimeType,
                         Size = doc.DocumentSize,
                         DcId = doc.DcId,
-                        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+                        Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
                     },
                     meta);
             }

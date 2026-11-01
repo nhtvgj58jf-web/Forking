@@ -31,6 +31,7 @@ public class MessageEntityService(
         options ??= MessageEntityProcessingOptions.Default;
 
         var working = entities?.ToList() ?? [];
+        working.RemoveAll(e => e.Length <= 0);
         MessageEntityValidator.Validate(text, working);
 
         if (string.IsNullOrEmpty(text))
@@ -71,6 +72,7 @@ public class MessageEntityService(
     public TVector<IMessageEntity>? ValidateAndNormalize(string? text, IEnumerable<IMessageEntity>? entities)
     {
         var working = entities?.ToList() ?? [];
+        working.RemoveAll(e => e.Length <= 0);
         MessageEntityValidator.Validate(text, working);
 
         if (string.IsNullOrEmpty(text))

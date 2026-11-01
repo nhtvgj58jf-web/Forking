@@ -35,6 +35,7 @@ public class SavedStarGiftDocument
     public TVector<IMessageEntity>? MessageEntities { get; set; }
     public long RandomId { get; set; }
     public bool PinnedToTop { get; set; }
+    public int PinOrder { get; set; }
     public bool? ChatNotificationsEnabled { get; set; } // channel-only
     public bool IsUnique { get; set; }   // upgraded to collectible
     public string? UniqueSlug { get; set; }

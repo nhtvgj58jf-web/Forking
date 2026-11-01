@@ -138,6 +138,7 @@ builder.ConfigureServices((ctx,
     services.AddHostedService<CallSessionExpiryBackgroundService>();
     services.AddHostedService<AccountDeletionBackgroundService>();
     services.AddHostedService<MyTelegram.Messenger.Services.ScheduledMessageSender>();
+    services.AddHostedService<MyTelegram.Messenger.Services.Bots.MarketNotifyService>();
     services.AddHostedService<MyTelegram.Messenger.Services.VideoProcessing.VideoProcessingBackgroundService>();
     services.AddHostedService<MyTelegram.Messenger.Services.HistoryImport.HistoryImportBackgroundService>();
     services.AddHostedService<MyTelegram.Messenger.Services.Transcription.TranscriptionBackgroundService>();

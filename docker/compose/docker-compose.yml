@@ -71,7 +71,7 @@ services:
 
   ### Minio
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     platform: ${DOCKER_PLATFORM:-linux/amd64}
     restart: always
     networks:
@@ -136,7 +136,7 @@ services:
       --max-port 49172
       --fingerprint
       --lt-cred-mech
-      --user testgram:testgram2024
+      --user testgram:3770a1549a6df5e3da855bc1
       --log-file stdout
 
   ### RTMP server for group calls and live stories
@@ -330,11 +330,12 @@ services:
 
   ### 3.Session server
   session-server:
-    image: ${MyTelegramRegistry}/mytelegram-session-server:${MyTelegramVersion}
+    image: local/session-server:nowelcome
     restart: always
     networks:
       - tg-net
     environment:
+      App__SendWelcomeMessageAfterUserSignIn: "false"
       Serilog__MinimumLevel__Default: ${Serilog__MinimumLevel__Default}
       ConnectionStrings__Default: ${ConnectionStrings__Default}
       # App__ThisDcId: ${App__ThisDcId}
@@ -504,7 +505,7 @@ services:
       # App__AutoCreateSuperGroup: ${App__AutoCreateSuperGroup}
       # App__EnableFutureAuthToken: ${App__EnableFutureAuthToken}
       # App__SetPremiumToTrueAfterUserCreated: ${App__SetPremiumToTrueAfterUserCreated}
-      # App__SendWelcomeMessageAfterUserSignIn: ${App__SendWelcomeMessageAfterUserSignIn}
+      App__SendWelcomeMessageAfterUserSignIn: "true"
       App__WebRtcConnections__0__Ip: ${App__WebRtcConnections__0__Ip}
       App__WebRtcConnections__0__Port: ${App__WebRtcConnections__0__Port}
       App__WebRtcConnections__0__Turn: ${App__WebRtcConnections__0__Turn}

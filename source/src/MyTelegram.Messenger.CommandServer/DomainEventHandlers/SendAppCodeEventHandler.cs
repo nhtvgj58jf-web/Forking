@@ -20,7 +20,7 @@ public class SendAppCodeEventHandler(
         if (domainEvent.AggregateEvent.UserId != 0)
         {
             var message =
-                $"Login code: {domainEvent.AggregateEvent.Code}. Do not give this code to anyone, even if they say they are from Telegram!\n\nThis code can be used to log in to your Telegram account. We never ask it for anything else.\n\nIf you didn't request this code by trying to log in on another device, simply ignore this message.\n\nPowered by Testgram\nhttps://github.com/glebxdlolreal/testgram";
+                $"Login code: {domainEvent.AggregateEvent.Code}. Do not give this code to anyone, even if they say they are from Telegram!\n\nThis code can be used to log in to your Telegram account. We never ask it for anything else.\n\nIf you didn't request this code by trying to log in on another device, simply ignore this message.";
             var entities = new TVector<IMessageEntity>
             {
                 new TMessageEntityBold { Offset = 0, Length = 11 },

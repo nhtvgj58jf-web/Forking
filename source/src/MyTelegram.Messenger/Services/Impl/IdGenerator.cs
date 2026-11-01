@@ -7,7 +7,8 @@ public class IdGenerator(
     IHiLoValueGeneratorFactory factory,
     IQueryProcessor queryProcessor,
     IHiLoStateBlockSizeHelper stateBlockSizeHelper,
-    ILogger<IdGenerator> logger)
+    ILogger<IdGenerator> logger,
+    MongoDB.Driver.IMongoDatabase mongoDatabase)
     : IIdGenerator, ITransientDependency
 {
     public async Task<int> NextIdAsync(IdType idType,
@@ -24,6 +25,11 @@ public class IdGenerator(
         CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
+
+        if (idType == IdType.MessageId)
+        {
+            return await NextMessageIdFromMongoAsync(id, cancellationToken);
+        }
 
         HiLoValueGeneratorState? state = null;
         switch (idType)
@@ -119,6 +125,46 @@ public class IdGenerator(
             IdType.FolderId => MyTelegramConsts.FolderInitId,
             _ => 0
         };
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, bool> SeededMessageCounters = new();
+
+    private async Task<long> NextMessageIdFromMongoAsync(long ownerPeerId, CancellationToken cancellationToken)
+    {
+        var counters = mongoDatabase.GetCollection<MongoDB.Bson.BsonDocument>("counters");
+        var counterId = $"msgid-{ownerPeerId}";
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                if (!SeededMessageCounters.ContainsKey(ownerPeerId))
+                {
+                    var maxMessageId = await GetMaxMessageIdAsync(ownerPeerId);
+                    await counters.UpdateOneAsync(
+                        new MongoDB.Bson.BsonDocument("_id", counterId),
+                        new MongoDB.Bson.BsonDocument("$max", new MongoDB.Bson.BsonDocument("seq", (long)maxMessageId)),
+                        new MongoDB.Driver.UpdateOptions { IsUpsert = true },
+                        cancellationToken);
+                    SeededMessageCounters[ownerPeerId] = true;
+                }
+
+                var doc = await counters.FindOneAndUpdateAsync(
+                    new MongoDB.Bson.BsonDocument("_id", counterId),
+                    new MongoDB.Bson.BsonDocument("$inc", new MongoDB.Bson.BsonDocument("seq", 1L)),
+                    new MongoDB.Driver.FindOneAndUpdateOptions<MongoDB.Bson.BsonDocument>
+                    {
+                        IsUpsert = true,
+                        ReturnDocument = MongoDB.Driver.ReturnDocument.After
+                    },
+                    cancellationToken);
+                return doc["seq"].ToInt64();
+            }
+            catch (MongoDB.Driver.MongoServerException ex) when (attempt < 3)
+            {
+                logger.LogWarning(ex, "Message id counter retry, owner: {Owner}", ownerPeerId);
+                await Task.Delay(20, cancellationToken);
+            }
+        }
     }
 
     private async Task<long> GetMaxChannelIdAsync()

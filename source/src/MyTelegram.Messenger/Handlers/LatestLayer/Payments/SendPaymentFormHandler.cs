@@ -458,7 +458,7 @@ internal sealed class SendPaymentFormHandler(
                 MimeType = gift.MimeType,
                 Size = gift.DocumentSize,
                 DcId = gift.DcId,
-                Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }],
+                Attributes = [new TDocumentAttributeSticker { Alt = "🎁", Stickerset = new TInputStickerSetEmpty() }, new TDocumentAttributeImageSize { W = 512, H = 512 }, new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }],
             },
         };
 

@@ -43,8 +43,28 @@ internal sealed class ChangePhoneHandler(
 
         await mongoDatabase.GetCollection<BsonDocument>("eventflow-userreadmodel")
             .UpdateOneAsync(
-                Builders<BsonDocument>.Filter.Eq("UserId.low", (int)input.UserId),
+                Builders<BsonDocument>.Filter.Eq("UserId", input.UserId),
                 Builders<BsonDocument>.Update.Set("PhoneNumber", phoneNumber));
+        if (phoneNumber.StartsWith("888"))
+        {
+            try
+            {
+                await mongoDatabase.GetCollection<BsonDocument>("fragment_collectibles").InsertOneAsync(new BsonDocument
+                {
+                    ["_id"] = $"fragment-phone-{phoneNumber}",
+                    ["type"] = "phone",
+                    ["phone"] = phoneNumber,
+                    ["purchase_date"] = (int)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    ["currency"] = "USD",
+                    ["amount"] = 29900,
+                    ["crypto_currency"] = "TON",
+                    ["crypto_amount"] = 100000000000L,
+                    ["url"] = $"https://fragment.com/number/{phoneNumber}"
+                });
+            }
+            catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey) { }
+        }
+
 
         var user = await userAppService.GetAsync(input.UserId);
         return userConverterService.ToUser(input, user!, layer: input.Layer);

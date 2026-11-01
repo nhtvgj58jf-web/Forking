@@ -145,7 +145,7 @@ public record SendMessageInput
     public IMessageMedia? Media { get; }
     public IInputMedia? InputMedia { get; }
 
-    public string Message { get; }
+    public string Message { get; init; }
     //public string? MessageActionData { get; }
     //public MessageActionType MessageActionType { get; }
     public MessageType MessageType { get; }

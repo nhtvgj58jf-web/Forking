@@ -1,0 +1,134 @@
+import os, re
+import aiosqlite
+from aiogram import F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           LabeledPrice, Message, PreCheckoutQuery)
+from admin import run, mongo, tail, ADMIN_IDS, SCRIPTS
+
+RATE = int(os.environ.get("STARS_RATE", "5"))
+PACKS = [10, 25, 50, 100, 500]
+SHOP_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop.db")
+PAYLOAD = re.compile(r"stars:(\d{5,15})")
+
+async def db_exec(sql, args=()):
+    async with aiosqlite.connect(SHOP_DB) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS payments (charge_id TEXT PRIMARY KEY, tg_id INTEGER, "
+                         "phone TEXT, paid INTEGER, credited INTEGER, status TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP)")
+        cur = await db.execute(sql, args)
+        await db.commit()
+        return cur.rowcount
+
+async def notify(bot, text):
+    for a in ADMIN_IDS:
+        try:
+            await bot.send_message(a, text, parse_mode=None)
+        except Exception:
+            pass
+
+async def resolve_user(digits):
+    js = ("const u=db['eventflow-userreadmodel'].findOne({PhoneNumber:{$in:['%s','+%s']}},{UserId:1});"
+          "print(u?u.UserId.toString():'')") % (digits, digits)
+    out = (await mongo(js))[1].strip().splitlines()
+    last = out[-1].strip() if out else ""
+    return last if re.fullmatch(r"\d{1,12}", last) else None
+
+def packs_kb(digits, tg_id):
+    packs = ([1] if tg_id in ADMIN_IDS else []) + PACKS
+    rows = [[InlineKeyboardButton(text="%d ⭐ → %d ⭐ Крикграма" % (n, n * RATE),
+                                  callback_data="pk:%s:%d" % (digits, n))] for n in packs]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def register(dp, get_numbers):
+    async def cmd_shop(m: Message):
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="⭐ Купить звёзды Крикграма", callback_data="shop:stars")]])
+        await m.answer("Магазин Крикграма. 1 ⭐ Telegram = %d ⭐ Крикграма." % RATE, reply_markup=kb, parse_mode=None)
+
+    async def cb_stars(c: CallbackQuery):
+        nums = [re.sub(r"\D", "", x) for x in await get_numbers(c.from_user.id)]
+        if not nums:
+            await c.message.answer("Сначала привяжи номер аккаунта Крикграма через /start.", parse_mode=None)
+        elif len(nums) == 1:
+            await c.message.answer("Аккаунт +%s. Сколько звёзд?" % nums[0],
+                                   reply_markup=packs_kb(nums[0], c.from_user.id), parse_mode=None)
+        else:
+            rows = [[InlineKeyboardButton(text="+" + d, callback_data="ac:" + d)] for d in nums]
+            await c.message.answer("На какой аккаунт зачислить?",
+                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode=None)
+        await c.answer()
+
+    async def cb_account(c: CallbackQuery):
+        d = c.data.split(":", 1)[1]
+        mine = [re.sub(r"\D", "", x) for x in await get_numbers(c.from_user.id)]
+        if d not in mine:
+            return await c.answer("Номер не привязан", show_alert=True)
+        await c.message.answer("Аккаунт +%s. Сколько звёзд?" % d, reply_markup=packs_kb(d, c.from_user.id), parse_mode=None)
+        await c.answer()
+
+    async def cb_pack(c: CallbackQuery):
+        _, d, n = c.data.split(":")
+        n = int(n)
+        if n not in PACKS and not (n == 1 and c.from_user.id in ADMIN_IDS):
+            return await c.answer("Нет такого пакета", show_alert=True)
+        await c.message.answer_invoice(title="%d ⭐ Крикграма" % (n * RATE),
+                                       description="Зачисление на аккаунт +%s" % d,
+                                       payload="stars:%s" % d, currency="XTR",
+                                       prices=[LabeledPrice(label="Звёзды", amount=n)])
+        await c.answer()
+
+    async def pre_checkout(q: PreCheckoutQuery):
+        if (q.invoice_payload or "").startswith("ord:"):
+            import orders
+            ok = await orders.check_pre(q)
+            return await q.answer(ok=ok, error_message=None if ok else "Заявка изменена или недоступна, открой её заново в боте")
+        ok = bool(PAYLOAD.fullmatch(q.invoice_payload or "")) and q.currency == "XTR"
+        await q.answer(ok=ok, error_message=None if ok else "Неверный заказ")
+
+    async def paid(m: Message):
+        p = m.successful_payment
+        if (p.invoice_payload or "").startswith("ord:"):
+            import orders
+            return await orders.on_paid(m)
+        mt = PAYLOAD.fullmatch(p.invoice_payload or "")
+        if not mt or p.currency != "XTR":
+            return await notify(m.bot, "Платёж с неверными данными: %s от %s, charge %s"
+                                % (p.invoice_payload, m.from_user.id, p.telegram_payment_charge_id))
+        digits, n = mt.group(1), p.total_amount
+        credited = n * RATE
+        charge = p.telegram_payment_charge_id
+        if not await db_exec("INSERT OR IGNORE INTO payments (charge_id,tg_id,phone,paid,credited,status) "
+                             "VALUES (?,?,?,?,?,'paid')", (charge, m.from_user.id, digits, n, credited)):
+            return  # этот платёж уже обработан
+        uid = await resolve_user(digits)
+        code, out = (1, "аккаунт не найден") if not uid else await run(
+            "bash", "%s/give-stars.sh" % SCRIPTS, uid, str(credited))
+        if code == 0:
+            await db_exec("UPDATE payments SET status='done' WHERE charge_id=?", (charge,))
+            await m.answer("✅ Зачислено %d ⭐ Крикграма на +%s" % (credited, digits), parse_mode=None)
+            await notify(m.bot, "Продано %d ⭐ (получено %d ⭐ Telegram), +%s, tg %s" % (credited, n, digits, m.from_user.id))
+        else:
+            await db_exec("UPDATE payments SET status='failed' WHERE charge_id=?", (charge,))
+            await m.answer("Платёж получен, но зачисление задержалось. Мы всё исправим.", parse_mode=None)
+            await notify(m.bot, "ОШИБКА зачисления %d ⭐ на +%s (tg %s, %d ⭐ Telegram)\ncharge: %s\n%s"
+                         % (credited, digits, m.from_user.id, n, charge, tail(out, 6)))
+
+    async def cmd_refund(m: Message, command: CommandObject):
+        a = (command.args or "").split()
+        if len(a) != 2 or not a[0].isdigit() or not re.fullmatch(r"[\w=\-]{5,128}", a[1]):
+            return await m.answer("/refund <tg_id> <charge_id>", parse_mode=None)
+        try:
+            await m.bot.refund_star_payment(user_id=int(a[0]), telegram_payment_charge_id=a[1])
+        except Exception as e:
+            return await m.answer("Ошибка: %s" % e, parse_mode=None)
+        await db_exec("UPDATE payments SET status='refunded' WHERE charge_id=?", (a[1],))
+        await m.answer("Возврат сделан. Звёзды Крикграма автоматически не списываются.", parse_mode=None)
+
+    adm = F.from_user.id.in_(ADMIN_IDS)
+    dp.message.register(cmd_shop, Command("shop"))
+    dp.callback_query.register(cb_stars, F.data == "shop:stars")
+    dp.callback_query.register(cb_account, F.data.startswith("ac:"))
+    dp.callback_query.register(cb_pack, F.data.startswith("pk:"))
+    dp.pre_checkout_query.register(pre_checkout)
+    dp.message.register(paid, F.successful_payment)
+    dp.message.register(cmd_refund, Command("refund"), adm)

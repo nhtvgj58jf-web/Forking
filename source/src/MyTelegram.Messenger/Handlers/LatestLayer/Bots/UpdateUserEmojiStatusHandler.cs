@@ -59,7 +59,7 @@ internal sealed class UpdateUserEmojiStatusHandler(
         {
             await commandBus.PublishAsync(new UpdateColorCommand(
                 UserId.Create(inputUser.UserId),
-                input.ToRequestInfo() with { ReqMsgId = 0 },
+                input.ToRequestInfo() with { ReqMsgId = input.ReqMsgId + 1 },
                 null,
                 true));
         }

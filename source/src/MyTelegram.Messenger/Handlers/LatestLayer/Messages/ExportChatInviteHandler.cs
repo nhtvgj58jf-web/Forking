@@ -38,12 +38,13 @@ internal sealed class ExportChatInviteHandler(ICommandBus commandBus, IIdGenerat
 
             await channelAdminRightsChecker.CheckAdminRightAsync(inputPeerChannel.ChannelId, input.UserId, (p) => p.InviteUsers, RpcErrors.RpcErrors403.ChatAdminRequired);
 
+            var usageLimit = obj.UsageLimit is 0 ? (int?)null : obj.UsageLimit;
             if (obj.ExpireDate is > 0 && obj.ExpireDate.Value <= CurrentDate)
             {
                 RpcErrors.RpcErrors400.ExpireDateInvalid.ThrowRpcError();
             }
 
-            if (obj.UsageLimit is <= 0)
+            if (usageLimit is < 0)
             {
                 RpcErrors.RpcErrors400.UsageLimitInvalid.ThrowRpcError();
             }
@@ -51,7 +52,7 @@ internal sealed class ExportChatInviteHandler(ICommandBus commandBus, IIdGenerat
             var subscriptionPricing = ChatInviteSubscriptionPricing.Validate(obj.SubscriptionPricing,
                 channelReadModel.Broadcast,
                 obj.RequestNeeded,
-                obj.UsageLimit);
+                usageLimit);
 
             if (obj.LegacyRevokePermanent)
             {
@@ -63,7 +64,7 @@ internal sealed class ExportChatInviteHandler(ICommandBus commandBus, IIdGenerat
                 }
             }
 
-            var command = new CreateChatInviteCommand(ChatInviteId.Create(inputPeerChannel.ChannelId, chatInviteId), input.ToRequestInfo(), inputPeerChannel.ChannelId, chatInviteId, inviteHash, input.UserId, obj.Title, obj.RequestNeeded, null, obj.ExpireDate, obj.UsageLimit, obj.LegacyRevokePermanent, CurrentDate, channelReadModel.Broadcast, subscriptionPricing?.Period, subscriptionPricing?.Amount);
+            var command = new CreateChatInviteCommand(ChatInviteId.Create(inputPeerChannel.ChannelId, chatInviteId), input.ToRequestInfo(), inputPeerChannel.ChannelId, chatInviteId, inviteHash, input.UserId, obj.Title, obj.RequestNeeded, null, obj.ExpireDate, usageLimit, obj.LegacyRevokePermanent, CurrentDate, channelReadModel.Broadcast, subscriptionPricing?.Period, subscriptionPricing?.Amount);
             await commandBus.PublishAsync(command);
             return null!;
         }

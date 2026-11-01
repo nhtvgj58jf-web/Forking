@@ -1,0 +1,158 @@
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using MyTelegram.Caching.Redis;
+using MyTelegram.Domain.Aggregates.Device;
+using MyTelegram.EventBus.RabbitMQ;
+using MyTelegram.EventBus.RabbitMQ.Extensions;
+using MyTelegram.Messenger;
+using MyTelegram.Messenger.Services.Email;
+using MyTelegram.Messenger.CommandServer.BackgroundServices;
+using MyTelegram.Messenger.CommandServer.Extensions;
+using MyTelegram.Messenger.Services.HistoryTTL;
+using MyTelegram.Messenger.Services.Impl;
+using Serilog;
+using Serilog.Sinks.SystemConsole.Themes;
+using MyTelegramConsts = MyTelegram.MyTelegramConsts;
+
+Console.Title = $"MyTelegram messenger command server (layer {MyTelegramConsts.Layer})";
+
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Async(c => c.Console(theme: AnsiConsoleTheme.Code))
+    .WriteTo.Async(c => c.File("Logs/startup-log.txt"))
+    .CreateLogger();
+
+Log.Information("{Info} {Version}", "MyTelegram messenger command server", typeof(Program).Assembly.GetName().Version);
+Log.Information("{Description} {Url}",
+    "For more information, please visit",
+    MyTelegramConsts.RepositoryUrl);
+
+Log.Information("MyTelegram messenger command server(API layer={Layer}) starting...",
+    MyTelegramConsts.Layer);
+
+AppDomain.CurrentDomain.UnhandledException += (_,
+    e) =>
+{
+    Log.Error(e.ExceptionObject.ToString() ?? "UnhandledException");
+};
+TaskScheduler.UnobservedTaskException += (_,
+    e) =>
+{
+    Log.Error(e.Exception.ToString());
+};
+var builder = Host.CreateDefaultBuilder(args);
+//builder.UseAutofac();
+builder.UseSerilog((context,
+    configuration) =>
+{
+    configuration.ReadFrom.Configuration(context.Configuration);
+});
+
+builder.ConfigureHostOptions(options =>
+{
+    options.ServicesStopConcurrently = true;
+});
+
+builder.ConfigureAppConfiguration(options =>
+{
+    options.AddEnvironmentVariables();
+    options.AddCommandLine(args);
+});
+builder.ConfigureServices((ctx,
+    services) =>
+{
+    services.AddOptions<MyTelegramMessengerServerOptions>()
+        .Bind(ctx.Configuration.GetRequiredSection("App"))
+        .ValidateDataAnnotations()
+        .ValidateOnStart()
+        ;
+
+    services.Configure<EmailSenderOptions>(ctx.Configuration.GetRequiredSection("EmailSenderOptions"));
+    var appConfig = ctx.Configuration.GetRequiredSection("App").Get<MyTelegramMessengerServerOptions>();
+
+    services.Configure<EventBusRabbitMqOptions>(ctx.Configuration.GetRequiredSection("RabbitMQ:EventBus"));
+    services.Configure<RabbitMqOptions>(ctx.Configuration.GetRequiredSection("RabbitMQ:Connections:Default"));
+
+    // Verification codes reach the Telegram delivery bot through a queue, not an HTTP call.
+    services.Configure<MyTelegram.Services.Services.BotCodeQueueOptions>(
+        ctx.Configuration.GetSection("TelegramBotSms"));
+
+    // Register Premium options
+    services.Configure<MyTelegram.Messenger.Options.PremiumOptions>(
+        ctx.Configuration.GetSection(MyTelegram.Messenger.Options.PremiumOptions.SectionName));
+
+    //services.AddMyTelegramRabbitMqEventBus();
+
+    var eventBusOptions = ctx.Configuration.GetRequiredSection("RabbitMQ:EventBus").Get<EventBusRabbitMqOptions>();
+    var rabbitMqOptions = ctx.Configuration.GetRequiredSection("RabbitMQ:Connections:Default").Get<RabbitMqOptions>();
+
+    services.AddMyTelegramRabbitMqEventBus();
+    //services.AddRebusEventBus(options =>
+    //{
+    //    options.Transport(t =>
+    //    {
+    //        t.UseRabbitMq(
+    //                $"amqp://{rabbitMqOptions!.UserName}:{rabbitMqOptions.Password}@{rabbitMqOptions.HostName}:{rabbitMqOptions.Port}",
+    //                eventBusOptions!.ClientName)
+    //            .ExchangeNames(eventBusOptions.ExchangeName, eventBusOptions.TopicExchangeName ?? "RebusTopics")
+    //            ;
+    //    });
+    //    options.AddSystemTextJson(jsonOptions =>
+    //    {
+    //        jsonOptions.TypeInfoResolverChain.Add(MyJsonSerializeContext.Default);
+    //        jsonOptions.TypeInfoResolverChain.Add(MyMessengerJsonContext.Default);
+    //    });
+    //});
+
+    services.AddMyTelegramMessengerCommandServer(options =>
+    {
+        options.AddDefaults(Assembly.GetEntryAssembly());
+    });
+
+    services.AddMyTelegramStackExchangeRedisCache(options =>
+    {
+        options.Configuration = ctx.Configuration.GetValue<string>("Redis:Configuration");
+    });
+    services.AddSingleton<StackExchange.Redis.IConnectionMultiplexer>(_ =>
+        StackExchange.Redis.ConnectionMultiplexer.Connect(
+            ctx.Configuration.GetValue<string>("Redis:Configuration")!));
+
+    services.AddHostedService<MyTelegramCommandServerBackgroundService>();
+    services.AddHostedService<MyTelegramInvokeAfterMsgProcessorBackgroundService>();
+
+    services.AddHostedService<MessageQueueDataProcessorBackgroundService<MessengerCommandDataReceivedEvent>>();
+    services.AddHostedService<MessageQueueDataProcessorBackgroundService<NewDeviceCreatedEvent>>();
+    services.AddHostedService<MessageQueueDataProcessorBackgroundService<ISessionMessage>>();
+    services.AddHostedService<MessageAutoDeleteService>();
+    services.AddHostedService<EmojiStatusExpirationService>();
+    services.AddHostedService<MessageQueueDataProcessorBackgroundService<IDomainEvent>>();
+    services.AddHostedService<QueuedCommandExecutorBackgroundService<DeviceAggregate, DeviceId>>();
+    services.AddHostedService<QueuedCommandExecutorBackgroundService<PtsAggregate, PtsId>>();
+    services.AddHostedService<GiveawayProcessorBackgroundService>();
+    services.AddHostedService<ChannelViewsBackgroundService>();
+    services.AddHostedService<StoryArchiveBackgroundService>();
+    services.AddHostedService<PollAutoCloseBackgroundService>();
+    services.AddHostedService<SuggestedPostSettlementBackgroundService>();
+    services.AddHostedService<StarsSubscriptionRenewalBackgroundService>();
+    services.AddSingleton<MyTelegram.Messenger.Services.Phone.CallSessionExpiryService>();
+    services.AddHostedService<CallSessionExpiryBackgroundService>();
+    services.AddHostedService<AccountDeletionBackgroundService>();
+    services.AddHostedService<MyTelegram.Messenger.Services.ScheduledMessageSender>();
+    services.AddHostedService<MyTelegram.Messenger.Services.VideoProcessing.VideoProcessingBackgroundService>();
+    services.AddHostedService<MyTelegram.Messenger.Services.HistoryImport.HistoryImportBackgroundService>();
+    services.AddHostedService<MyTelegram.Messenger.Services.Transcription.TranscriptionBackgroundService>();
+    services.AddHostedService<MyTelegram.Messenger.Services.AdminLog.AdminLogIndexInitializer>();
+
+    services.Configure<HostOptions>(options =>
+    {
+        options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+    });
+});
+
+
+var app = builder.Build();
+
+Log.Information("Messenger command server starting RunAsync...");
+_ = app.RunAsync();
+Log.Information("Messenger command server running, waiting...");
+Thread.Sleep(Timeout.Infinite);

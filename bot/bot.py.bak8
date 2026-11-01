@@ -1,0 +1,569 @@
+"""TestGram login-code delivery bot.
+
+Codes are consumed from RabbitMQ, which the rest of the stack already runs on. The bot opens no
+listening socket of its own: the previous version exposed an unauthenticated HTTP endpoint on
+0.0.0.0:5005, which meant anybody who found the port could make it send any text to the owner of any
+linked number, and it fought with a second copy of itself over that port under systemd.
+
+Everything else the bot does — linking numbers, the language switcher — is unchanged.
+"""
+import asyncio
+import json
+import logging
+import os
+import re
+import signal
+import sys
+
+import aio_pika
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("testgram-bot")
+
+# The bot normally runs under systemd, but reading .env here keeps the same config working when it is
+# started by hand from /root/testgram.
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    seen_keys = set()
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                # A repeated key is almost always a second bot token pasted under the same name, where
+                # only the first one counts. Saying so beats wondering why the bot never came up.
+                if k in seen_keys:
+                    logger.warning("%s is set more than once in .env; keeping the first value. "
+                                   "Extra bots go in BOT_TOKEN1..BOT_TOKEN9", k)
+                seen_keys.add(k)
+                os.environ.setdefault(k, v.strip())
+else:
+    logger.warning(".env not found at %s, using the environment only", env_path)
+
+DB_PATH = os.environ.get("DB_PATH", "/root/testgram/bot/codes.db")
+MAX_NUMBERS = int(os.environ.get("MAX_NUMBERS", "2"))
+
+# Queue topology. Both halves declare it, so whichever starts first creates it; the names have to match
+# TelegramBotSmsOptions on the .NET side.
+CODES_EXCHANGE = os.environ.get("BOT_CODES_EXCHANGE", "telegram-bot-codes")
+CODES_QUEUE = os.environ.get("BOT_CODES_QUEUE", "telegram-bot-codes")
+CODES_ROUTING_KEY = os.environ.get("BOT_CODES_ROUTING_KEY", "code")
+PREFETCH_COUNT = int(os.environ.get("BOT_CODES_PREFETCH", "10"))
+
+LANGUAGES = ("en", "ru")
+DEFAULT_LANG = "en"
+
+# All user-facing text lives here so both languages stay in sync.
+STRINGS = {
+    "en": {
+        "add_number": "➕ Add number",
+        "switch_lang": "🌐 Русский",
+        "no_numbers": "📱 No linked numbers.\nLimit: 0/{max}",
+        "your_numbers": "📱 Your CrikGram numbers:\n{numbers}\n\nLimit: {count}/{max}",
+        "limit_alert": "Limit is {max} numbers",
+        "enter_number": "Send the number: +79XXXXXXXXX",
+        "bad_format": "Invalid format",
+        "added": "✅ Added!",
+        "limit": "❌ Limit {max}",
+        "taken": "❌ Already taken",
+        "exists": "✅ Already linked",
+        "code": "📱 Code for {phone}: <code>{code}</code>",
+    },
+    "ru": {
+        "add_number": "➕ Добавить номер",
+        "switch_lang": "🌐 English",
+        "no_numbers": "📱 Нет привязанных номеров.\nЛимит: 0/{max}",
+        "your_numbers": "📱 Ваши номера CrikGram:\n{numbers}\n\nЛимит: {count}/{max}",
+        "limit_alert": "Лимит {max} номера",
+        "enter_number": "Введите номер: +79XXXXXXXXX",
+        "bad_format": "Неверный формат",
+        "added": "✅ Добавлен!",
+        "limit": "❌ Лимит {max}",
+        "taken": "❌ Занят",
+        "exists": "✅ Уже есть",
+        "code": "📱 Код для {phone}: <code>{code}</code>",
+    },
+}
+
+
+def normalize_lang(language_code):
+    """Map a Telegram language_code ("ru-RU", "en", None, ...) to a supported language."""
+    if not language_code:
+        return DEFAULT_LANG
+    primary = re.split(r"[-_]", language_code)[0].strip().lower()
+    return primary if primary in LANGUAGES else DEFAULT_LANG
+
+
+def t(lang, key, **kwargs):
+    """Look up a string, falling back to DEFAULT_LANG for unknown languages."""
+    table = STRINGS.get(lang) or STRINGS[DEFAULT_LANG]
+    return table[key].format(**kwargs)
+
+def collect_bot_tokens():
+    """Return the tokens to run: BOT_TOKEN plus any BOT_TOKEN1..BOT_TOKEN9, in order."""
+    keys = ["BOT_TOKEN"] + [f"BOT_TOKEN{i}" for i in range(1, 10)]
+    tokens = []
+    seen = set()
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            tokens.append(value)
+    return tokens
+
+
+def get_rabbitmq_url():
+    """Return the AMQP URL to consume codes from.
+
+    RABBITMQ_URL=AUTO (the default) reads the broker's container IP with docker inspect: the stack does
+    not publish 5672 on the host, so a bot running outside docker has to dial the container directly.
+    """
+    url = os.environ.get("RABBITMQ_URL", "").strip()
+    if url and url.upper() != "AUTO":
+        return url
+
+    import subprocess
+
+    user = os.environ.get("RABBITMQ_USER", "test")
+    password = os.environ.get("RABBITMQ_PASSWORD", "testgram2024")
+    candidates = [
+        os.environ.get("RABBITMQ_CONTAINER", ""),
+        "mytelegram-rabbitmq-1",
+        "mytelegram_rabbitmq_1",
+        "compose-rabbitmq-1",
+        "compose_rabbitmq_1",
+    ]
+
+    for container in [name for name in candidates if name]:
+        try:
+            ip = subprocess.check_output(
+                ["docker", "inspect", "-f",
+                 "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            continue
+        if ip:
+            logger.info("RabbitMQ auto-detected at %s (%s)", ip, container)
+            return f"amqp://{user}:{password}@{ip}/"
+
+    logger.warning("RabbitMQ auto-detect failed, falling back to localhost")
+    return f"amqp://{user}:{password}@localhost/"
+
+BOT_TOKENS = collect_bot_tokens()
+
+# bot_id -> Bot, so a code goes out through the bot the number was linked with. One Dispatcher drives
+# all of them.
+bots = {}
+dp = Dispatcher()
+
+# Users that pressed "add number" and are expected to send a phone number next.
+waiting_for_phone = set()
+
+# One long-lived connection instead of one per query: the old code opened three connections to deliver
+# a single code, and every open competed for the same write lock.
+_db: aiosqlite.Connection | None = None
+
+
+def digits_of(phone):
+    """The comparable form of a phone number: digits only.
+
+    Matching used to happen in SQL with replace(replace(phone,'+',''),'-',''), which only knew about two
+    of the characters people type; anything else stored made the number unreachable.
+    """
+    return re.sub(r"\D", "", phone or "")
+
+
+async def open_db():
+    """Open the database and bring the schema up to date."""
+    global _db
+    _db = await aiosqlite.connect(DB_PATH)
+    # WAL keeps the reader (the code consumer) from blocking on the writer (the link flow), and a
+    # busy timeout turns the rare overlap into a wait rather than "database is locked".
+    await _db.execute("PRAGMA journal_mode=WAL")
+    await _db.execute("PRAGMA busy_timeout=5000")
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS user_numbers (
+            tg_id INTEGER, phone TEXT, bot_id INTEGER, PRIMARY KEY (tg_id, phone)
+        )
+    """)
+    async with _db.execute("PRAGMA table_info(user_numbers)") as cur:
+        columns = [row[1] for row in await cur.fetchall()]
+    if "bot_id" not in columns:
+        await _db.execute("ALTER TABLE user_numbers ADD COLUMN bot_id INTEGER")
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            tg_id INTEGER PRIMARY KEY, lang TEXT
+        )
+    """)
+    await _db.commit()
+
+async def get_lang(tg_id, language_code=None):
+    """The stored interface language, detected from Telegram on first contact."""
+    async with _db.execute("SELECT lang FROM user_settings WHERE tg_id=?", (tg_id,)) as cur:
+        row = await cur.fetchone()
+    if row and row[0] in LANGUAGES:
+        return row[0]
+    detected = normalize_lang(language_code)
+    if language_code is not None:
+        await set_lang(tg_id, detected)
+    return detected
+
+
+async def set_lang(tg_id, lang):
+    """Persist the interface language for a Telegram user."""
+    if lang not in LANGUAGES:
+        lang = DEFAULT_LANG
+    await _db.execute(
+        "INSERT INTO user_settings (tg_id, lang) VALUES (?,?) "
+        "ON CONFLICT(tg_id) DO UPDATE SET lang=excluded.lang",
+        (tg_id, lang),
+    )
+    await _db.commit()
+
+
+async def get_user_numbers(tg_id):
+    """All TestGram phone numbers attached to a Telegram account."""
+    async with _db.execute("SELECT phone FROM user_numbers WHERE tg_id=?", (tg_id,)) as cur:
+        return [r[0] for r in await cur.fetchall()]
+
+
+async def get_owner_of(phone):
+    """The (tg_id, bot_id) a phone number is linked to, comparing digits only.
+
+    The two spellings clients actually store hit the index; anything else falls back to a scan, which is
+    what makes an oddly formatted number reachable at all (the old SQL knew only about "+" and "-").
+    """
+    wanted = digits_of(phone)
+    if not wanted:
+        return None, None
+
+    async with _db.execute(
+        "SELECT tg_id, bot_id FROM user_numbers WHERE phone=? OR phone=?", (wanted, f"+{wanted}")
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        return row[0], row[1]
+
+    async with _db.execute("SELECT tg_id, bot_id, phone FROM user_numbers") as cur:
+        rows = await cur.fetchall()
+    for tg_id, bot_id, stored in rows:
+        if digits_of(stored) == wanted:
+            return tg_id, bot_id
+    return None, None
+
+
+async def add_number(tg_id, phone, bot_id):
+    """Attach a phone number to a Telegram user, enforcing the limit and uniqueness."""
+    numbers = await get_user_numbers(tg_id)
+    if len(numbers) >= MAX_NUMBERS:
+        return "limit"
+    owner, _ = await get_owner_of(phone)
+    if owner and owner != tg_id:
+        return "taken"
+    if phone in numbers:
+        return "exists"
+    await _db.execute("INSERT OR IGNORE INTO user_numbers (tg_id, phone, bot_id) VALUES (?,?,?)",
+                      (tg_id, phone, bot_id))
+    await _db.commit()
+    return "ok"
+
+
+async def add_number_force(tg_id, phone, bot_id):
+    """Привязка купленного номера: лимит бесплатных номеров на платные не распространяется."""
+    await _db.execute("INSERT OR IGNORE INTO user_numbers (tg_id, phone, bot_id) VALUES (?,?,?)", (tg_id, phone, bot_id))
+    await _db.commit()
+
+
+async def remove_number(tg_id, phone):
+    """Detach a phone number from a Telegram user."""
+    return  # удаление отключено
+    await _db.commit()
+
+def numbers_keyboard(numbers, lang):
+    """The inline keyboard for adding/removing numbers and switching language."""
+    buttons = []
+    other = "ru" if lang == "en" else "en"
+    buttons.append([InlineKeyboardButton(text=t(lang, "switch_lang"), callback_data=f"lang:{other}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def status_text(numbers, lang):
+    """The account status shown by /start and after every change."""
+    if not numbers:
+        return t(lang, "no_numbers", max=MAX_NUMBERS)
+    nums_str = "\n".join(f"  • {n}" for n in numbers)
+    return t(lang, "your_numbers", numbers=nums_str, count=len(numbers), max=MAX_NUMBERS)
+
+
+import shop; shop.register(dp, get_user_numbers)
+import admin; admin.register(dp)
+import number; number.register(dp, get_user_numbers, add_number, MAX_NUMBERS)
+import number; number.register_start(dp, get_lang, get_user_numbers, status_text, numbers_keyboard)
+import orders
+orders.register(dp, get_user_numbers, add_number_force)
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    waiting_for_phone.discard(message.from_user.id)
+    lang = await get_lang(message.from_user.id, message.from_user.language_code)
+    numbers = await get_user_numbers(message.from_user.id)
+    await message.answer(status_text(numbers, lang), reply_markup=numbers_keyboard(numbers, lang))
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def cb_lang(call: CallbackQuery):
+    """Switch the interface language and redraw the status message."""
+    await set_lang(call.from_user.id, call.data[5:])
+    lang = await get_lang(call.from_user.id)
+    numbers = await get_user_numbers(call.from_user.id)
+    await call.message.edit_text(status_text(numbers, lang), reply_markup=numbers_keyboard(numbers, lang))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "add")
+async def cb_add(call: CallbackQuery):
+    """Start the phone-number binding flow."""
+    await call.answer("Используйте «🎲 Получить случайный номер»", show_alert=True)
+    return
+    lang = await get_lang(call.from_user.id, call.from_user.language_code)
+    numbers = await get_user_numbers(call.from_user.id)
+    if len(numbers) >= MAX_NUMBERS:
+        await call.answer(t(lang, "limit_alert", max=MAX_NUMBERS), show_alert=True)
+        return
+    waiting_for_phone.add(call.from_user.id)
+    await call.answer(t(lang, "enter_number"))
+    await call.message.delete()
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_del(call: CallbackQuery):
+    """Remove the selected phone number from the user's account."""
+    lang = await get_lang(call.from_user.id, call.from_user.language_code)
+    await call.answer("Удаление номеров отключено", show_alert=True); return
+    numbers = await get_user_numbers(call.from_user.id)
+    await call.message.edit_text(status_text(numbers, lang), reply_markup=numbers_keyboard(numbers, lang))
+    await call.answer()
+
+
+@dp.message()
+async def handle_phone(message: Message, bot: Bot):
+    """Validate and save the phone number sent after pressing the add button."""
+    if message.from_user.id not in waiting_for_phone:
+        return
+    lang = await get_lang(message.from_user.id, message.from_user.language_code)
+    phone = (message.text or "").strip()
+    if not re.match(r"^\+?7\d{10}$", phone):
+        await message.answer(t(lang, "bad_format"))
+        return
+    result = await add_number(message.from_user.id, phone, bot.id)
+    await message.answer({
+        "ok": t(lang, "added"),
+        "limit": t(lang, "limit", max=MAX_NUMBERS),
+        "taken": t(lang, "taken"),
+        "exists": t(lang, "exists"),
+    }[result])
+    waiting_for_phone.discard(message.from_user.id)
+    numbers = await get_user_numbers(message.from_user.id)
+    await message.answer(status_text(numbers, lang), reply_markup=numbers_keyboard(numbers, lang))
+
+
+def get_bot_for(bot_id):
+    """The Bot a number was linked with, falling back to the first configured one.
+
+    The fallback covers bindings made through a bot whose token is no longer configured. It is logged,
+    because the fallback bot can only message users who have written to it: Telegram refuses the rest
+    with "bot can't initiate conversation", and that looks like a lost code with no other explanation.
+    """
+    if bot_id is not None and bot_id in bots:
+        return bots[bot_id]
+    fallback = next(iter(bots.values()), None)
+    if fallback is not None and bot_id is not None:
+        logger.warning("Number was linked through bot %s, which is not configured; using bot %s instead",
+                       bot_id, fallback.id)
+    return fallback
+
+async def send_code(owner, phone, code, bot_id):
+    """Deliver one login code. Returns True when Telegram accepted the message."""
+    target_bot = get_bot_for(bot_id)
+    if target_bot is None:
+        logger.error("No bot available to deliver the code for %s", phone)
+        return False
+
+    lang = await get_lang(owner)
+    text = t(lang, "code", phone=phone, code=code)
+
+    for attempt in (1, 2):
+        try:
+            await target_bot.send_message(owner, text, parse_mode="HTML")
+            logger.info("Delivered the code for %s to user %s via bot %s", phone, owner, target_bot.id)
+            return True
+        except TelegramForbiddenError:
+            # Nothing to retry: the user has to write to this bot first, or has blocked it.
+            logger.warning("User %s cannot be messaged by bot %s (never started it, or blocked it)",
+                           owner, target_bot.id)
+            return False
+        except TelegramRetryAfter as e:
+            logger.warning("Rate limited for %s seconds while delivering to %s", e.retry_after, owner)
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            if attempt == 2:
+                logger.error("Could not deliver the code for %s to user %s: %s", phone, owner, e)
+                return False
+            logger.warning("Delivery to user %s failed (%s), retrying once", owner, e)
+            await asyncio.sleep(1)
+    return False
+
+
+async def on_code_message(message: aio_pika.abc.AbstractIncomingMessage):
+    """Handle one queued code.
+
+    The message is always acknowledged: a login code lives for minutes, so requeueing it would only make
+    the queue grow behind a code nobody can use any more. Whatever went wrong is in the log instead.
+    """
+    async with message.process(requeue=False):
+        try:
+            data = json.loads(message.body.decode())
+        except Exception as e:
+            logger.error("Dropping an unreadable code message: %s", e)
+            return
+
+        phone = str(data.get("phone") or "")
+        code = str(data.get("code") or "")
+        if not phone or not code:
+            logger.error("Dropping a code message with no phone or code: %s", data)
+            return
+
+        owner, bot_id = await get_owner_of(phone)
+        if not owner:
+            logger.warning("No linked Telegram user for %s, dropping the code", phone)
+            return
+
+        await send_code(owner, phone, code, bot_id)
+
+async def consume_codes(url):
+    """Consume login codes until cancelled.
+
+    connect_robust reconnects on its own, so a broker restart is a pause rather than a crash — the codes
+    published meanwhile wait in the durable queue.
+    """
+    connection = await aio_pika.connect_robust(url, client_properties={"connection_name": "testgram-bot"})
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=PREFETCH_COUNT)
+        exchange = await channel.declare_exchange(CODES_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True)
+        queue = await channel.declare_queue(CODES_QUEUE, durable=True)
+        await queue.bind(exchange, routing_key=CODES_ROUTING_KEY)
+
+        logger.info("Consuming codes from %s (exchange %s, key %s)", CODES_QUEUE, CODES_EXCHANGE,
+                    CODES_ROUTING_KEY)
+        await queue.consume(on_code_message)
+        await asyncio.Future()
+
+
+async def main():
+    if not BOT_TOKENS:
+        raise RuntimeError("No bot token configured. Set BOT_TOKEN (and optionally BOT_TOKEN1..) in .env")
+
+    from aiogram.client.session.aiohttp import AiohttpSession
+
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        logger.info("Using proxy %s", proxy_url)
+    else:
+        logger.info("No proxy, connecting to Telegram directly")
+
+    for token in BOT_TOKENS:
+        from aiogram.client.telegram import PRODUCTION, TelegramAPIServer
+        _base = os.environ.get("TG_API_BASE", "").rstrip("/")
+        session = AiohttpSession(proxy=proxy_url or None, api=TelegramAPIServer.from_base(_base) if _base else PRODUCTION) if (proxy_url or _base) else None
+        # Creating the Bot can fail on its own for a malformed token, and one bad token must not take the
+        # other bots down with it.
+        b = None
+        try:
+            b = Bot(token=token, session=session)
+            me = await b.get_me()
+        except Exception as e:
+            logger.error("Skipping bot %s...: %s", token.split(":")[0], e)
+            if b is not None:
+                await b.session.close()
+            continue
+        bots[b.id] = b
+        logger.info("Configured bot @%s (id=%s)", me.username, b.id)
+
+    if not bots:
+        raise RuntimeError("No bot could be authorized; check the tokens in .env")
+
+    await open_db()
+
+    from aiogram.types import BotCommand
+    for b in bots.values():
+        try:
+            await b.set_my_commands([
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="number", description="Получить номер для входа"),
+                BotCommand(command="shop", description="Купить звёзды Крикграма"),
+                BotCommand(command="help", description="Список функций"),
+            ])
+        except Exception as e:
+            logger.warning("set_my_commands failed: %s", e)
+
+    stopping = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stopping.set)
+
+    consumer = asyncio.create_task(consume_codes(get_rabbitmq_url()), name="codes")
+    polling = asyncio.create_task(dp.start_polling(*bots.values(), handle_signals=False), name="polling")
+
+    logger.info("Running %d bot(s); no HTTP port is opened", len(bots))
+
+    # Either task ending on its own is a failure worth restarting for (systemd does that); a signal is a
+    # normal shutdown.
+    done, _ = await asyncio.wait(
+        [consumer, polling, asyncio.create_task(stopping.wait(), name="signal")],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    exit_code = 0
+    for task in done:
+        if task.get_name() == "signal":
+            logger.info("Shutting down")
+            continue
+        exit_code = 1
+        if task.exception() is not None:
+            logger.error("The %s task failed: %s", task.get_name(), task.exception())
+
+    try:
+        await dp.stop_polling()
+    except Exception:
+        # Raised when polling never started (an early failure in the consumer, say).
+        pass
+
+    for task in (consumer, polling):
+        task.cancel()
+    await asyncio.gather(consumer, polling, return_exceptions=True)
+
+    for b in bots.values():
+        await b.session.close()
+    if _db is not None:
+        await _db.close()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()) or 0)
+
+
+
+
+
+
+
+
+

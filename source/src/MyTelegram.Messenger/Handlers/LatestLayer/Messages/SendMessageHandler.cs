@@ -87,7 +87,7 @@ namespace MyTelegram.Messenger.Handlers.LatestLayer.Messages;
 /// <remarks>
 /// Access: [User ✔] [Bot ✔] [Anonymous ✖]
 /// </remarks>
-internal sealed class SendMessageHandler(IMessageAppService messageAppService, IPeerHelper peerHelper, IChannelAppService channelAppService, IOptions<MyTelegramMessengerServerOptions> options, IQueryProcessor queryProcessor, IConnectionMultiplexer redis, IMongoDatabase mongoDatabase, IBotFatherBotService botFatherBotService, IObjectMessageSender objectMessageSender, IPrivacyAppService privacyAppService, IMessageEffectAppService messageEffectAppService, ILogger<SendMessageHandler> logger) : RpcResultObjectHandler<RequestSendMessage, IUpdates>
+internal sealed class SendMessageHandler(IMessageAppService messageAppService, IPeerHelper peerHelper, IChannelAppService channelAppService, IOptions<MyTelegramMessengerServerOptions> options, IQueryProcessor queryProcessor, IConnectionMultiplexer redis, IMongoDatabase mongoDatabase, IBotFatherBotService botFatherBotService, ICrikBotService crikBotService, IModerationBotService moderationBot, IObjectMessageSender objectMessageSender, IPrivacyAppService privacyAppService, IMessageEffectAppService messageEffectAppService, ILogger<SendMessageHandler> logger) : RpcResultObjectHandler<RequestSendMessage, IUpdates>
 {
     protected override async Task<IUpdates> HandleCoreAsync(IRequestInput input, RequestSendMessage obj)
     {
@@ -228,6 +228,10 @@ internal sealed class SendMessageHandler(IMessageAppService messageAppService, I
 
         if (toPeer.PeerType == PeerType.User && toPeer.PeerId == BotFatherBotService.BotUserId)
             _ = Task.Run(() => botFatherBotService.HandleMessageAsync(input, input.UserId, obj.Message));
+        else if (toPeer.PeerType == PeerType.User && toPeer.PeerId >= 600000000001L)
+            _ = Task.Run(() => crikBotService.TryHandleAsync(input, input.UserId, toPeer.PeerId, obj.Message));
+        else if (toPeer.PeerType == PeerType.Channel && obj.Message.Length > 0 && obj.Message[0] == '/')
+            _ = Task.Run(() => moderationBot.HandleAsync(input, toPeer, obj.Message, obj.ReplyTo));
         return null !;
     }
 

@@ -69,7 +69,7 @@ internal sealed class GetCustomEmojiDocumentsHandler(
     {
         var modelAttributeFilter = new BsonDocument
         {
-            ["Type"] = "model",
+            ["Type"] = new BsonDocument("$in", new BsonArray(new[] { "model", "pattern" })),
             ["DocumentId"] = new BsonDocument("$in", new BsonArray(documentIds))
         };
         var giftFilter = new BsonDocument("Attributes",
@@ -103,7 +103,7 @@ internal sealed class GetCustomEmojiDocumentsHandler(
             var attribute = value.AsBsonDocument;
             if (!attribute.TryGetValue("Type", out var type) ||
                 !type.IsString ||
-                type.AsString != "model" ||
+                (type.AsString != "model" && type.AsString != "pattern") ||
                 !attribute.TryGetValue("DocumentId", out var documentId))
             {
                 continue;
@@ -232,7 +232,9 @@ internal sealed class GetCustomEmojiDocumentsHandler(
                     Alt = "🎁",
                     Free = true,
                     Stickerset = new TInputStickerSetEmpty()
-                }
+                },
+                new TDocumentAttributeImageSize { W = 512, H = 512 },
+                new TDocumentAttributeFilename { FileName = "AnimatedSticker.tgs" }
             ];
         }
 
